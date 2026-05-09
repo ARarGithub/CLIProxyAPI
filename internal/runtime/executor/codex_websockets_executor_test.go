@@ -347,7 +347,7 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 func TestApplyCodexPromptCacheHeadersSetsLowercaseSessionAndLegacyConversation(t *testing.T) {
 	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
 
-	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+	_, headers := applyCodexPromptCacheHeaders(context.Background(), "openai-response", req, []byte(`{"model":"gpt-5-codex"}`), nil)
 
 	if got := headerValueCaseInsensitive(headers, "session_id"); got != "cache-1" {
 		t.Fatalf("session_id = %s, want cache-1", got)
@@ -357,6 +357,31 @@ func TestApplyCodexPromptCacheHeadersSetsLowercaseSessionAndLegacyConversation(t
 	}
 	if got := headers.Get("Conversation_id"); got != "cache-1" {
 		t.Fatalf("Conversation_id = %s, want cache-1", got)
+	}
+}
+
+func TestApplyCodexPromptCacheHeadersDerivesSessionIDPerAuth(t *testing.T) {
+	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
+	authA := &cliproxyauth.Auth{ID: "auth-A"}
+	authB := &cliproxyauth.Auth{ID: "auth-B"}
+
+	_, hA := applyCodexPromptCacheHeaders(context.Background(), "openai-response", req, []byte(`{"model":"gpt-5-codex"}`), authA)
+	_, hB := applyCodexPromptCacheHeaders(context.Background(), "openai-response", req, []byte(`{"model":"gpt-5-codex"}`), authB)
+
+	sidA := headerValueCaseInsensitive(hA, "session_id")
+	sidB := headerValueCaseInsensitive(hB, "session_id")
+	if sidA == "" || sidB == "" {
+		t.Fatalf("session_id missing: A=%q B=%q", sidA, sidB)
+	}
+	if sidA == "cache-1" || sidB == "cache-1" {
+		t.Fatalf("websocket forwarded raw client cache key without derivation: A=%q B=%q", sidA, sidB)
+	}
+	if sidA == sidB {
+		t.Fatalf("websocket leaked session_id across auths: %q", sidA)
+	}
+	if hA.Get("Conversation_id") != sidA || hB.Get("Conversation_id") != sidB {
+		t.Fatalf("Conversation_id must mirror derived session_id (A: %q vs %q; B: %q vs %q)",
+			hA.Get("Conversation_id"), sidA, hB.Get("Conversation_id"), sidB)
 	}
 }
 

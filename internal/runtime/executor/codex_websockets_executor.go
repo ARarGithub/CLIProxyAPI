@@ -220,7 +220,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders := applyCodexPromptCacheHeaders(ctx, from, req, body, auth)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
@@ -420,7 +420,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders := applyCodexPromptCacheHeaders(ctx, from, req, body, auth)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
@@ -803,7 +803,7 @@ func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 	return parsed.String(), nil
 }
 
-func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header) {
+func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, auth *cliproxyauth.Auth) ([]byte, http.Header) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
 		return rawJSON, headers
@@ -829,6 +829,26 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 			cache.ID = promptCacheKey.String()
 		}
 	}
+
+	// Inherit session_id from inbound body / header for the direct Codex CLI
+	// websocket path so per-auth re-derivation can break cross-account
+	// continuity. See LEAK_RISKS.md L1.
+	if cache.ID == "" {
+		if pck := gjson.GetBytes(rawJSON, "prompt_cache_key"); pck.Exists() {
+			if pckStr := strings.TrimSpace(pck.String()); pckStr != "" {
+				cache.ID = pckStr
+			}
+		}
+	}
+	if cache.ID == "" {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			if sid := strings.TrimSpace(headerValueCaseInsensitive(ginCtx.Request.Header, "session_id")); sid != "" {
+				cache.ID = sid
+			}
+		}
+	}
+
+	cache.ID = derivePerAuthSessionID(cache.ID, auth)
 
 	if cache.ID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
