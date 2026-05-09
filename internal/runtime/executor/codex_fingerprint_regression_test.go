@@ -13,10 +13,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -172,7 +172,7 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 		ginCtx.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 		if sc.inboundAPIKey != "" {
-			ginCtx.Set("apiKey", sc.inboundAPIKey)
+			ginCtx.Set("userApiKey", sc.inboundAPIKey)
 		}
 		for k, v := range sc.ginHeaders {
 			ginCtx.Request.Header.Set(k, v)
