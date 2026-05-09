@@ -169,6 +169,40 @@ const codexUserAgent = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.
 
 **未涵蓋**：Claude 4h proactive refresh（`sdk/auth/claude.go:34`）—— 非 Codex/OpenAI，按 fork 範圍跳過。
 
+### 過渡 / 遷移情境（舊 auth 檔在新 fork 上的行為）
+
+`refresh_interval_seconds` 只在兩條路徑被 write：
+1. OAuth 新 login（`sdk/auth/codex_device.go:buildAuthRecord`）
+2. Token refresh 成功（`internal/runtime/executor/codex_executor.go:Refresh`）
+
+**舊 auth 檔（沒有此欄位）的三個常見情境**：
+
+| 情境 | 何時欄位才會出現 | 過渡期排程行為 |
+|---|---|---|
+| **(1a) 啟動前 disabled，啟動後啟用** | 啟用後該 auth 進入排程；當下次 Refresh 成功時寫入。如果啟用瞬間 auth 已在 refresh window 內，jitter 會在 0–30min 內觸發 Refresh，欄位很快寫入。若不在 window，要等到 `expiry - random_lead` 自然到達 | 排程使用 `RefreshLead()` 即時 roll，仍是 [3d, 7d) 隨機；只是「跨重啟穩定」缺失 |
+| **(1b) 啟動前就 enabled** | 啟動後 auto-refresh loop 立刻把 auth 排進 heap；Refresh 觸發時寫入。同上：在 window 內 → jitter 後即觸發；不在 → 等到 `expiry - random_lead` | 同 (1a) |
+| **(2) 從 management API 上傳 / import** | 上傳 handler 只把 bytes 原樣寫到磁碟，不修 metadata。之後同 (1b)：第一次 Refresh 才寫入 | 同 (1a) |
+
+三個情境都有同一個事實：**指紋保護從那個 auth 進入排程的第一秒就生效**（因為 `RefreshLead()` 隨機是 SDK 排程器主動呼叫的），**只是還沒持久化到 metadata 而已**。對「平常使用」沒影響；對「頻繁 docker pull/restart」場景才會在過渡期碰到 re-roll 收斂問題（每次重啟 re-roll，多次重啟後值傾向 maxLead）。
+
+**緊迫場景的手動補種**（一次性 jq 腳本，給「import 一大批舊 auth 後想立刻穩定」的使用情境）：
+
+```bash
+cd path/to/auths
+for f in *.json; do
+  type=$(jq -r '.type // ""' "$f")
+  has=$(jq -e 'has("refresh_interval_seconds")' "$f" >/dev/null 2>&1 && echo yes || echo no)
+  if [ "$type" = "codex" ] && [ "$has" = "no" ]; then
+    rand=$(awk 'BEGIN{srand(); printf "%d", 259200 + int(rand() * (604800 - 259200))}')
+    jq ". + {refresh_interval_seconds: $rand}" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    echo "seeded $f with $rand seconds"
+  fi
+done
+# 跑完後重啟 proxy 讓 manager 重讀
+```
+
+跑完每個 codex auth 都有 [3d, 7d) 內穩定的隨機 lead，跨重啟也不會 re-roll 直到下次 Refresh 才換新值。**重啟 proxy 才會生效**（讓 manager 重讀 metadata）。
+
 ---
 
 ## 🟡 L5：TLS 偽裝只覆蓋 Anthropic，Codex/Gemini 裸奔
