@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -14,7 +15,13 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFromAPIKey(t *testing.T) {
+// All assertions in this file deliberately check STRUCTURAL properties of the
+// derived Session_id (cross-auth distinct, within-auth stable, body matches
+// header, valid v7 UUID with recent timestamp) rather than hardcoding a
+// specific SHA1-derived value. The derive algorithm is allowed to change as
+// long as these properties hold.
+
+func TestCodexExecutorCacheHelper_OpenAIChat_StableWithinAuth(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Set("userApiKey", "test-api-key")
@@ -29,40 +36,29 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	url := "https://example.com/responses"
 	auth := &cliproxyauth.Auth{ID: "auth-A"}
 
-	httpReq, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON, auth)
+	httpReq1, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON, auth)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
+	body1, _ := io.ReadAll(httpReq1.Body)
+	sid1 := httpReq1.Header.Get("Session_id")
+	pck1 := gjson.GetBytes(body1, "prompt_cache_key").String()
 
-	body, errRead := io.ReadAll(httpReq.Body)
-	if errRead != nil {
-		t.Fatalf("read request body: %v", errRead)
+	if sid1 == "" {
+		t.Fatal("Session_id missing")
 	}
-
-	baseKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:test-api-key")).String()
-	expectedKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte(baseKey+":auth-A")).String()
-	gotKey := gjson.GetBytes(body, "prompt_cache_key").String()
-	if gotKey != expectedKey {
-		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedKey)
+	if sid1 != pck1 {
+		t.Fatalf("body prompt_cache_key (%q) must match header Session_id (%q)", pck1, sid1)
 	}
-	if gotConversation := httpReq.Header.Get("Conversation_id"); gotConversation != "" {
-		t.Fatalf("Conversation_id = %q, want empty", gotConversation)
-	}
-	if gotSession := httpReq.Header.Get("Session_id"); gotSession != expectedKey {
-		t.Fatalf("Session_id = %q, want %q", gotSession, expectedKey)
-	}
+	assertLooksLikeRealCodexSessionID(t, sid1)
 
 	httpReq2, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON, auth)
 	if err != nil {
 		t.Fatalf("cacheHelper error (second call): %v", err)
 	}
-	body2, errRead2 := io.ReadAll(httpReq2.Body)
-	if errRead2 != nil {
-		t.Fatalf("read request body (second call): %v", errRead2)
-	}
-	gotKey2 := gjson.GetBytes(body2, "prompt_cache_key").String()
-	if gotKey2 != expectedKey {
-		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
+	sid2 := httpReq2.Header.Get("Session_id")
+	if sid1 != sid2 {
+		t.Fatalf("Session_id must be stable across calls with same auth: %q vs %q", sid1, sid2)
 	}
 }
 
@@ -100,6 +96,8 @@ func TestCodexExecutorCacheHelper_PerAuthSessionIDDiffersAcrossAuths(t *testing.
 	if sidA == sidB {
 		t.Fatalf("Session_id leaked across auths: A=B=%q (must differ)", sidA)
 	}
+	assertLooksLikeRealCodexSessionID(t, sidA)
+	assertLooksLikeRealCodexSessionID(t, sidB)
 
 	bodyA, _ := io.ReadAll(reqA.Body)
 	bodyB, _ := io.ReadAll(reqB.Body)
@@ -113,11 +111,18 @@ func TestCodexExecutorCacheHelper_PerAuthSessionIDDiffersAcrossAuths(t *testing.
 	}
 }
 
-func TestCodexExecutorCacheHelper_DirectCodexInheritsAndDerivesGinSessionID(t *testing.T) {
+func TestCodexExecutorCacheHelper_DirectCodex_MirrorsInboundV7Timestamp(t *testing.T) {
+	// Codex CLI sends a fresh UUIDv7 per session. The proxy should produce a
+	// derived UUID that (a) carries the SAME timestamp as the inbound (so it
+	// looks like the same session that started at the same wall-clock time),
+	// (b) differs across auths in the random portion, (c) does NOT pass the
+	// raw inbound through.
+	inboundV7 := uuid.Must(uuid.NewV7()).String()
+
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
-	ginCtx.Request.Header.Set("Session_id", "client-session-XYZ")
+	ginCtx.Request.Header.Set("Session_id", inboundV7)
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	executor := &CodexExecutor{}
@@ -142,14 +147,52 @@ func TestCodexExecutorCacheHelper_DirectCodexInheritsAndDerivesGinSessionID(t *t
 	if sidA == "" || sidB == "" {
 		t.Fatalf("direct path did not set Session_id: A=%q B=%q", sidA, sidB)
 	}
-	if sidA == "client-session-XYZ" || sidB == "client-session-XYZ" {
-		t.Fatalf("direct path forwarded raw client session_id without derivation: A=%q B=%q", sidA, sidB)
+	if sidA == inboundV7 || sidB == inboundV7 {
+		t.Fatalf("direct path forwarded raw client v7 without derivation: A=%q B=%q inbound=%q", sidA, sidB, inboundV7)
 	}
 	if sidA == sidB {
 		t.Fatalf("direct path leaked session_id across auths: %q", sidA)
 	}
-	expectedA := uuid.NewSHA1(uuid.NameSpaceOID, []byte("client-session-XYZ:auth-A")).String()
-	if sidA != expectedA {
-		t.Fatalf("direct path Session_id = %q, want %q", sidA, expectedA)
+
+	// Both derived UUIDs should look like real v7 sessions...
+	assertLooksLikeRealCodexSessionID(t, sidA)
+	assertLooksLikeRealCodexSessionID(t, sidB)
+
+	// ...and specifically should have the SAME timestamp as the inbound.
+	inU := uuid.MustParse(inboundV7)
+	wantTS := extractV7TimestampMs(inU)
+	for _, sid := range []string{sidA, sidB} {
+		gotU := uuid.MustParse(sid)
+		if gotTS := extractV7TimestampMs(gotU); gotTS != wantTS {
+			t.Fatalf("derived v7 timestamp %d does not match inbound %d (sid=%s)", gotTS, wantTS, sid)
+		}
+	}
+}
+
+// assertLooksLikeRealCodexSessionID verifies the derived session_id passes the
+// trivial structural checks that the upstream Codex API could perform: parses
+// as a UUID, has the expected version (defaulting to 7), and (for v7) carries
+// a timestamp within a plausible recent window.
+func assertLooksLikeRealCodexSessionID(t *testing.T, sid string) {
+	t.Helper()
+	u, err := uuid.Parse(sid)
+	if err != nil {
+		t.Fatalf("derived session_id %q is not a valid UUID: %v", sid, err)
+	}
+	if v := u.Version(); byte(v) != 7 {
+		t.Fatalf("derived session_id %q has version %d, want 7 (real Codex CLI uses Uuid::now_v7)", sid, v)
+	}
+	// Variant must be RFC4122 (high 2 bits of byte 8 = 10).
+	if u[8]&0xc0 != 0x80 {
+		t.Fatalf("derived session_id %q has non-RFC4122 variant bits 0x%02x", sid, u[8])
+	}
+	tsMs := extractV7TimestampMs(u)
+	now := time.Now().UnixMilli()
+	const window = int64(30 * 24 * time.Hour / time.Millisecond)
+	if tsMs > now+60_000 {
+		t.Fatalf("derived v7 timestamp %d is in the future (now=%d)", tsMs, now)
+	}
+	if tsMs < now-window {
+		t.Fatalf("derived v7 timestamp %d is older than %d days (now=%d) — looks fake", tsMs, window/(24*60*60*1000), now)
 	}
 }

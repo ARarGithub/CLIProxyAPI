@@ -10,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -264,6 +266,19 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 				}
 			}
 
+			// Structural v7 mimic check: every upstream-bound Session_id (and
+			// the matching body prompt_cache_key) must look like a real Codex
+			// CLI v7 UUID. A v5 / v4 / random-timestamp-v7 leaks the proxy by
+			// trivial inspection. See LEAK_RISKS.md L1.
+			for _, rec := range []recordedUpstreamRequest{recordA, recordB} {
+				if sid := rec.Headers.Get("Session_id"); sid != "" {
+					assertCodexV7Mimic(t, "header Session_id", sid)
+				}
+				if pck := gjson.GetBytes(rec.Body, "prompt_cache_key").String(); pck != "" {
+					assertCodexV7Mimic(t, "body prompt_cache_key", pck)
+				}
+			}
+
 			resetRecorded()
 			recordA1 := runOnce(t, "auth-A", "token-A", sc)
 			recordA2 := runOnce(t, "auth-A", "token-A", sc)
@@ -377,4 +392,38 @@ func truncateForLog(s string, max int) string {
 		return s
 	}
 	return s[:max] + fmt.Sprintf("...(%d bytes)", len(s))
+}
+
+// assertCodexV7Mimic asserts that a session-correlating value sent to upstream
+// looks like a real Codex CLI session id: parses as a UUID, has version 7, has
+// RFC4122 variant bits, and carries a recent timestamp in the leading 48 bits.
+//
+// Real Codex CLI uses Uuid::now_v7() (codex-rs/protocol/src/session_id.rs).
+// Anything else (v5, v4, or v7-with-implausible-timestamp) is a trivial check
+// the upstream can perform to flag the proxy.
+func assertCodexV7Mimic(t *testing.T, label, value string) {
+	t.Helper()
+	u, err := uuid.Parse(value)
+	if err != nil {
+		t.Errorf("LEAK: %s = %q is not a valid UUID — does not look like real Codex CLI session_id", label, value)
+		return
+	}
+	if v := byte(u.Version()); v != 7 {
+		t.Errorf("LEAK: %s = %q has UUID version %d (real Codex CLI uses v7)", label, value, v)
+		return
+	}
+	if u[8]&0xc0 != 0x80 {
+		t.Errorf("LEAK: %s = %q has non-RFC4122 variant bits 0x%02x", label, value, u[8])
+		return
+	}
+	tsMs := extractV7TimestampMs(u)
+	now := time.Now().UnixMilli()
+	const recentWindow = int64(30 * 24 * time.Hour / time.Millisecond)
+	if tsMs > now+60_000 {
+		t.Errorf("LEAK: %s = %q has v7 timestamp %d in the future (now=%d)", label, value, tsMs, now)
+	}
+	if tsMs < now-recentWindow {
+		t.Errorf("LEAK: %s = %q has v7 timestamp %d older than 30 days (now=%d) — looks SHA1-derived",
+			label, value, tsMs, now)
+	}
 }
