@@ -135,8 +135,8 @@ git push origin "${UPSTREAM_TAG}-cpa"
 | `v7.1.0-cpa.1` | `v7.1.0` | 在 `v7.1.0-cpa` 之後又改了 fork-local patch |
 
 `-cpa` tag 推上去之後 `.github/workflows/ghcr-publish.yml` 自動 build 一個對應 image：
-- `ghcr.io/ararfgithub/cli-proxy-api:v7.1.0-cpa`（pinned，永遠不動）
-- `ghcr.io/ararfgithub/cli-proxy-api:latest`（移到這個 tag）
+- `ghcr.io/arargithub/cli-proxy-api:v7.1.0-cpa`（pinned，永遠不動）
+- `ghcr.io/arargithub/cli-proxy-api:latest`（移到這個 tag）
 
 **只在「升級 upstream 大/中版號」時打 tag**。fork-local 小修不打 tag——就靠 `latest` + commit SHA tag 跑。
 
