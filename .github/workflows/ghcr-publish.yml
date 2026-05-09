@@ -1,17 +1,23 @@
 name: ghcr-publish
 
-# Builds a multi-arch Docker image of this fork on every push to main and
-# pushes it to GitHub Container Registry (ghcr.io) under the repo owner's
-# namespace. Auth uses the auto-injected per-run GITHUB_TOKEN — no PAT, no
-# long-lived secret on developer machines.
+# Builds a multi-arch Docker image of this fork and pushes it to GitHub
+# Container Registry (ghcr.io) under the repo owner's namespace.
+# Authentication uses the per-run GITHUB_TOKEN with packages:write — scoped
+# to this workflow run, auto-revoked after the run, never stored on any
+# developer machine. No PAT setup required.
 #
-# This workflow is fork-local and intentionally separate from the upstream
-# .github/workflows/docker-image.yml (which targets Docker Hub on tag pushes
-# only) so upstream merges do not conflict with it.
+# Triggers:
+#   - push to main          -> tags :latest and :<short_sha>
+#   - push of v*-cpa tag    -> tags :<git_tag> and :latest
+#                              (e.g. v7.0.0-cpa = upstream v7.0.0 + fork patches)
+#
+# Kept separate from upstream's existing docker-image.yml (which targets
+# Docker Hub on tag pushes only) so upstream merges remain clean.
 
 on:
   push:
     branches: [main]
+    tags: ['v*-cpa', 'v*-cpa.*']
   workflow_dispatch: {}
 
 permissions:
@@ -38,6 +44,24 @@ jobs:
           echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            git_tag="${GITHUB_REF#refs/tags/}"
+            # Tag push: pin a release-named image AND move :latest.
+            printf 'list<<EOF\n%s:%s\n%s:latest\nEOF\n' \
+              '${{ steps.img.outputs.name }}' "$git_tag" \
+              '${{ steps.img.outputs.name }}' >> $GITHUB_OUTPUT
+            echo "version=$git_tag" >> $GITHUB_OUTPUT
+          else
+            # Branch push: :latest moves, plus a commit-pinned tag for rollback.
+            printf 'list<<EOF\n%s:latest\n%s:%s\nEOF\n' \
+              '${{ steps.img.outputs.name }}' \
+              '${{ steps.img.outputs.name }}' '${{ steps.meta.outputs.sha }}' >> $GITHUB_OUTPUT
+            echo "version=${{ steps.meta.outputs.sha }}" >> $GITHUB_OUTPUT
+          fi
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -55,11 +79,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            VERSION=${{ steps.meta.outputs.sha }}
+            VERSION=${{ steps.tags.outputs.version }}
             COMMIT=${{ steps.meta.outputs.commit }}
             BUILD_DATE=${{ steps.meta.outputs.date }}
-          tags: |
-            ${{ steps.img.outputs.name }}:latest
-            ${{ steps.img.outputs.name }}:${{ steps.meta.outputs.sha }}
+          tags: ${{ steps.tags.outputs.list }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+

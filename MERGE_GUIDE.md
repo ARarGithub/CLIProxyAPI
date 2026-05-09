@@ -115,6 +115,31 @@ git commit --no-edit       # 或自己改 merge message
 git push origin main
 ```
 
+### Step 7 — Tag with the fork-local convention（如果 upstream 帶進來的是新 release）
+
+如果剛 merge 進來的 upstream 包含新 tag（例如 `v7.1.0`），且 main 上 fork 的 patch 全部驗證 OK，就用「upstream tag + `-cpa`」的格式打 tag：
+
+```bash
+# 例如 upstream 剛出 v7.1.0、merge 完 + 驗證 gate 通過
+UPSTREAM_TAG=v7.1.0
+git tag -a "${UPSTREAM_TAG}-cpa" -m "fork ${UPSTREAM_TAG}-cpa: upstream ${UPSTREAM_TAG} + L1 + L4"
+git push origin "${UPSTREAM_TAG}-cpa"
+```
+
+`-cpa` = Cli-Proxy-API（fork 自己的後綴），讓 fork 的 release 跟 upstream tag 一眼可對：
+
+| Fork tag | 對應 upstream | 內容 |
+|---|---|---|
+| `v7.0.0-cpa` | `v7.0.0` | upstream v7.0.0 + L1 + L4 |
+| `v7.1.0-cpa` | `v7.1.0` | upstream v7.1.0 + L1 + L4（可能含 patch 重新貼合） |
+| `v7.1.0-cpa.1` | `v7.1.0` | 在 `v7.1.0-cpa` 之後又改了 fork-local patch |
+
+`-cpa` tag 推上去之後 `.github/workflows/ghcr-publish.yml` 自動 build 一個對應 image：
+- `ghcr.io/ararfgithub/cli-proxy-api:v7.1.0-cpa`（pinned，永遠不動）
+- `ghcr.io/ararfgithub/cli-proxy-api:latest`（移到這個 tag）
+
+**只在「升級 upstream 大/中版號」時打 tag**。fork-local 小修不打 tag——就靠 `latest` + commit SHA tag 跑。
+
 ---
 
 ## 4. 常見衝突模式 + 解法
