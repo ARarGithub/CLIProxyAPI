@@ -202,6 +202,20 @@ git push origin "${UPSTREAM_TAG}-cpa"
 3. 跑回歸測試確認 fingerprint 還是被擋住
 4. 更新本檔的「主要檔案」清單與不變式
 
+### Mode H — `.github/workflows/docker-image.yml` 被 upstream 修改
+
+**症狀**：merge 時出現 `CONFLICT (modify/delete): .github/workflows/docker-image.yml`。
+
+**解法**：**保持刪除狀態**。這個 workflow 是 upstream 用來 push 到他們的 Docker Hub repo `eceasy/cli-proxy-api`，需要 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secret 才能跑——本 fork 沒有也不需要這些 secret，每次 tag push 都會失敗噪音化 Actions 頁面。fork 用 `.github/workflows/ghcr-publish.yml` 推到 ghcr.io 取代它。
+
+```bash
+git rm .github/workflows/docker-image.yml
+git add .github/workflows/docker-image.yml   # 確認刪除狀態被 stage
+# 繼續 merge commit
+```
+
+如果哪天 fork 也想推 Docker Hub，**新建一個 `.github/workflows/dockerhub-publish.yml`** 模仿 `ghcr-publish.yml` 的結構（讀 `DOCKERHUB_*` secret），不要 revive `docker-image.yml`，理由同 §3 開頭：避開高頻檔案。
+
 ---
 
 ## 5. 萬一回歸測試 fail
