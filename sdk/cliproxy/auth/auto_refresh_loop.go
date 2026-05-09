@@ -3,12 +3,29 @@ package auth
 import (
 	"container/heap"
 	"context"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 )
+
+// startupBurstJitter caps the random delay applied when nextRefreshCheckAt
+// would otherwise return "fire now". Spreading immediate-refresh decisions
+// over this window prevents a refresh burst when many auths fall inside
+// their refresh window simultaneously (e.g. process restart, docker pull
+// + up cycle, fresh upgrade with no persisted refresh_interval_seconds).
+//
+// See LEAK_RISKS.md A3/I5.
+const startupBurstJitter = 30 * time.Minute
+
+// jitteredNow returns now plus a random delay in [0, startupBurstJitter).
+// Use it whenever nextRefreshCheckAt would return "fire immediately" so
+// concurrent due auths spread out instead of all firing in one tick.
+func jitteredNow(now time.Time) time.Time {
+	return now.Add(time.Duration(rand.Int63n(int64(startupBurstJitter))))
+}
 
 type authAutoRefreshLoop struct {
 	manager     *Manager
@@ -369,12 +386,12 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		candidates := make([]time.Time, 0, 2)
 		if hasExpiry && !expiry.IsZero() {
 			if !expiry.After(now) || expiry.Sub(now) <= pref {
-				return now, true
+				return jitteredNow(now), true
 			}
 			candidates = append(candidates, expiry.Add(-pref))
 		}
 		if lastRefresh.IsZero() {
-			return now, true
+			return jitteredNow(now), true
 		}
 		candidates = append(candidates, lastRefresh.Add(pref))
 		next := candidates[0]
@@ -384,7 +401,7 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 			}
 		}
 		if !next.After(now) {
-			return now, true
+			return jitteredNow(now), true
 		}
 		return next, true
 	}
@@ -397,14 +414,14 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 	if hasExpiry && !expiry.IsZero() {
 		dueAt := expiry.Add(-*lead)
 		if !dueAt.After(now) {
-			return now, true
+			return jitteredNow(now), true
 		}
 		return dueAt, true
 	}
 	if !lastRefresh.IsZero() {
 		dueAt := lastRefresh.Add(*lead)
 		if !dueAt.After(now) {
-			return now, true
+			return jitteredNow(now), true
 		}
 		return dueAt, true
 	}

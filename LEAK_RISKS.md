@@ -126,7 +126,7 @@ const codexUserAgent = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.
 ## 🟡 L4：Codex 5 天 / Claude 4 小時 proactive refresh lead
 
 **嚴重度**：🟡 中（時序指紋）
-**狀態**：`[ ]`
+**狀態**：`[~]` Codex 已修（2026-05-10），Claude 未動（fork 範圍外）
 **對應 checklist**：A2, A4
 
 ### 機制
@@ -150,6 +150,24 @@ const codexUserAgent = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.
 3. 若保留 proactive，加 jitter（lead ± random%）避免多帳號同時點對齊
 
 選 (2) 最乾淨，但對「token 接近 expiry 時碰到批量請求」的瞬間延遲略增（單次 refresh 幾百 ms）。
+
+### 已採用方案（fork-local patch，僅 Codex）
+
+**(3) jitter + persistence**：保留 proactive 模式，每個 cycle roll 一個 [3d, 7d] 的隨機 lead，並把 roll 結果 persist 到 auth metadata，避免重啟 re-roll 收斂到 maxLead。
+
+- 新增 `internal/auth/codex/refresh_lead.go` — `NextRefreshLead()` 回 `[RefreshLeadMin=3d, RefreshLeadMax=7d)` 內的隨機 `time.Duration`。
+- `sdk/auth/codex.go` 的 `CodexAuthenticator.RefreshLead()` 改用 helper：每次呼叫 roll 一次。
+- `sdk/auth/codex_device.go` 的 `buildAuthRecord` 在 OAuth 登入完成時就把首個 roll 寫進 `auth.Metadata["refresh_interval_seconds"]`，新登入憑證從第一秒就有 persisted 值。
+- `internal/runtime/executor/codex_executor.go` 的 `Refresh()` 成功後 roll 並寫新值到同一個 metadata key，下個 cycle 用新 roll、cycle 之間獨立。
+- SDK 已存在的 `authPreferredInterval`（`sdk/cliproxy/auth/conductor.go:3328`）會優先讀 `Metadata["refresh_interval_seconds"]`，不需要改 SDK 排程邏輯。
+- **Startup burst jitter**（同時解 docker pull/up burst 與「升級過渡期」的 burst）：`sdk/cliproxy/auth/auto_refresh_loop.go` 加 `jitteredNow()` helper 並把 `nextRefreshCheckAt` 內 6 個 `return now, true` 改為 `return jitteredNow(now), true`，把任何「立刻到期」的決策散到 0~30min 內。
+- 測試：`internal/auth/codex/refresh_lead_test.go`（範圍 + variance）、`sdk/auth/codex_refresh_lead_test.go`（CodexAuthenticator 委派 + re-roll）、`sdk/cliproxy/auth/jitter_test.go`（jitter 範圍 + 均勻分佈）。
+
+**對 web 前端**：完全相容。`refresh_interval_seconds` 是 SDK 既有欄位（不是 fork 自己發明的），管理 UI 即使把 metadata 全部展示出來也只是多一個整數欄位，不影響功能。
+
+**對 config**：完全不動 config schema，所有設定值都在 metadata 裡。
+
+**未涵蓋**：Claude 4h proactive refresh（`sdk/auth/claude.go:34`）—— 非 Codex/OpenAI，按 fork 範圍跳過。
 
 ---
 

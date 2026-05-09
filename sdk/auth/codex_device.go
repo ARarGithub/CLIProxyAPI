@@ -274,6 +274,9 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 	fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 	metadata := map[string]any{
 		"email": tokenStorage.Email,
+		// Seed the persisted refresh lead at login time so the first scheduling
+		// cycle uses a deterministic, restart-safe value (see LEAK_RISKS.md A2).
+		"refresh_interval_seconds": int(codex.NextRefreshLead().Seconds()),
 	}
 
 	fmt.Println("Codex authentication successful")

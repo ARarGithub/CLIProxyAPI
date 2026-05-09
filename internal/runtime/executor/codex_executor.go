@@ -730,6 +730,11 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	auth.Metadata["type"] = "codex"
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
+	// Roll the next refresh lead and persist it so future scheduling uses a
+	// stable per-cycle value (see LEAK_RISKS.md A2). Without persistence,
+	// frequent restarts re-roll on every rebuild and converge the effective
+	// refresh time toward maxLead.
+	auth.Metadata["refresh_interval_seconds"] = int(codexauth.NextRefreshLead().Seconds())
 	return auth, nil
 }
 
