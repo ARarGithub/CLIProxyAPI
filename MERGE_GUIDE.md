@@ -98,18 +98,21 @@ go build ./... 2>&1 | head -20
 # 5a. L1 回歸測試 — 跨 auth fingerprint 必須測過
 go test ./internal/runtime/executor/ -run 'TestCodexUpstreamFingerprintRegression' -v
 
-# 5b. L1 + L4 unit tests
+# 5b. Session ID 行為測試套件 — 詳見 §6
+go test ./internal/runtime/executor/ -run 'TestDerivePerAuthSessionID' -v
+
+# 5c. L1 + L4 unit tests
 go test ./internal/runtime/executor/ -run 'CodexExecutorCacheHelper|ApplyCodexPromptCacheHeaders'
 go test ./internal/auth/codex/ -run 'NextRefreshLead'
 go test ./sdk/auth/ -run 'CodexAuthenticator_RefreshLead'
 go test ./sdk/cliproxy/auth/ -run 'JitteredNow'
 
-# 5c. 全測試（看是否引入新 regression；本 fork 預期 3 個既有失敗：
+# 5d. 全測試（看是否引入新 regression；本 fork 預期 3 個既有失敗：
 #     antigravity_executor_credits_test.go x 2、registry/model_definitions_test.go x 1）
 go test ./... 2>&1 | tail -30
 ```
 
-**Gate 條件**：5a + 5b 必須全綠。5c 的失敗清單必須跟 merge 前一致（沒有「新增」的失敗）。
+**Gate 條件**：5a + 5b + 5c 必須全綠。5d 的失敗清單必須跟 merge 前一致（沒有「新增」的失敗）。
 
 ### Step 6 — Commit + push
 
@@ -247,7 +250,58 @@ git add .github/workflows/docker-image.yml   # 確認刪除狀態被 stage
 
 ---
 
-## 6. 已知預先存在的測試失敗（不要修，不影響）
+## 6. Session ID 行為測試套件
+
+> **動 `derivePerAuthSessionID` 之前先看這節**。每條測試對應一個 patch 必須保住的不變式，跑掉哪條就回去看是不是把對應的不變式破壞了。
+
+測試檔：`internal/runtime/executor/codex_session_id_test.go`
+
+執行：
+
+```bash
+go test ./internal/runtime/executor/ -run 'TestDerivePerAuthSessionID' -v
+```
+
+| 測試 | 不變式 |
+|---|---|
+| `_Deterministic_CodexDirect` | Codex 直連路徑：同 `(originalID, auth.ID)` 跨 50 次呼叫輸出一致（timestamp 借自 inbound 不變） |
+| `_Deterministic_NonCodex` | 非 codex 路徑：同 `(originalID, auth.ID)` 跨 50 次呼叫輸出一致（in-memory cache 命中） |
+| `_AuthSwitching_RoundTrip_CodexDirect` | 切換 `(X,A)→(X,B)→(X,A)→(X,B)` 後，`s0==s2 ∧ s1==s3 ∧ s0!=s1`。回到舊 auth 必須拿到原本的 upstream id（讓 prompt cache 連續性可用）|
+| `_AuthSwitching_RoundTrip_NonCodex` | 同上，覆蓋非 codex 路徑（cache 必須以 auth 為維度獨立 pin） |
+| `_Timestamp_BorrowedFromInboundV7` | Codex 直連的輸出 v7 timestamp 必須**等於** inbound v7 timestamp（不論 auth 是哪個） |
+| `_Timestamp_PinnedAtFirstCall_NonCodex` | 非 codex 路徑 first-call 的輸出 timestamp 在「呼叫前 `time.Now()`」與「呼叫後 `time.Now()`」之間（誤差 100ms 容忍）；之後即使 sleep 過了，第二次呼叫的輸出 timestamp 必須等於第一次（cache pin） |
+| `_Timestamp_DifferentAuthsHaveIndependentCacheEntries` | 同 `originalID` + 不同 `auth.ID` 的 cache 必須是獨立 entry，各自 pin 各自的 timestamp |
+| `_DifferentInputs_DifferentOutputs` | 同 auth + 不同 originalID → 不同 output |
+| `_DifferentAuths_DifferentOutputs` | 同 originalID + 不同 auth → 不同 output（這是 L1 主訴求） |
+| `_EmptyOriginalID_ReturnsEmpty` | 空字串 / 純空白 originalID → 回空字串（防止 derive 出垃圾） |
+| `_NilAuth_ReturnsOriginal` | nil auth → 原樣回 originalID（測試友善 + 防呆） |
+| `_EmptyAuthID_ReturnsOriginal` | 空 auth.ID → 原樣回 originalID（同上） |
+| `_NonV7Inbound_OutputsV7` | inbound 是 v4 / v5 / 任意字串時，輸出仍然是 v7（**永遠不要把 inbound 的非 v7 版本傳到上游**） |
+| `_StructurallyValidV7` | 5 個 inbound 變體（v7 / v4 / v5 / 非 UUID / 長字串）的輸出都通過 `assertLooksLikeRealCodexSessionID`（合法 UUID + version=7 + RFC4122 variant + timestamp 在最近 30 天內） |
+| `_ConcurrentSameInput_AllAgree` | 64 個 goroutine 同時對同一個 input 呼叫，輸出必須全部一致（cache mutex 沒壞） |
+
+### 加新測試的時機
+
+- 新增 fingerprint 通道時（例如 derive 函式的輸入或輸出多了一個欄位）
+- 新增一個 inbound 格式時（例如 fork 之後支援新的 client 種類）
+- 上游改了 UUID 套件 / 換了 hash 演算法 / Codex CLI 升級到 UUIDv8
+- 動到 `cachedDerivedTimestampMs` 的 cache 行為（TTL、cleanup、lock 等）
+
+### 故障診斷對照（除了這套測試之外，回歸測試 fail 訊息對照見 §5）
+
+| 跑掛的測試 | 通常原因 |
+|---|---|
+| `_Deterministic_*` | derive 函式被改成非純函數（例如直接用 `time.Now()` 不經 cache） |
+| `_AuthSwitching_RoundTrip_*` | cache key 算法被改、不再以 `(originalID, auth.ID)` pair 為唯一索引 |
+| `_Timestamp_BorrowedFromInboundV7` | derive 對 inbound v7 timestamp 的處理被打掉（例如改成永遠用 `time.Now()`）|
+| `_Timestamp_PinnedAtFirstCall_NonCodex` | 非 codex 路徑沒在用 cache，每次都 fresh `time.Now()` |
+| `_NonV7Inbound_OutputsV7` | derive 函式被改成「mirror inbound version」之類的——不要這樣做，real Codex CLI 永遠是 v7 |
+| `_StructurallyValidV7` | version bits / variant bits / timestamp 注入邏輯壞了 |
+| `_ConcurrentSameInput_AllAgree` | cache mutex 漏掉、變成 race-condition |
+
+---
+
+## 7. 已知預先存在的測試失敗（不要修，不影響）
 
 下列測試在純 upstream HEAD 也會失敗，跟本 fork 無關：
 
@@ -259,7 +313,7 @@ git add .github/workflows/docker-image.yml   # 確認刪除狀態被 stage
 
 ---
 
-## 7. 維護紀錄
+## 8. 維護紀錄
 
 | 日期 | 動作 | Commit |
 |---|---|---|
