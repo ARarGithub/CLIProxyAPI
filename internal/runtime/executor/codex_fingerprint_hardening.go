@@ -84,23 +84,24 @@ func applyCodexFingerprintHardeningWS(ctx context.Context, body []byte, headers 
 
 // codexFingerprintValues holds the derived fields that get written to the
 // outgoing request. The first four (session/thread/window/installation) are
-// always produced; the conditional family (subagent / parentThread /
-// attestation) is only populated when the inbound request actually carries
-// them. Real Codex CLI only emits the conditional headers in subagent flow
-// or when an attestation provider is configured — synthesizing them on
-// non-codex paths would itself be a fingerprint.
+// always produced; the conditional family (subagent / parentThread) is only
+// populated when the inbound request actually carries them. Real Codex CLI
+// only emits the conditional headers in subagent flow — synthesizing them
+// on non-codex paths would itself be a fingerprint.
+//
+// Attestation is intentionally NOT a field here: see audit note in
+// computeCodexFingerprintValues.
 type codexFingerprintValues struct {
 	sessionDerived string
 	threadDerived  string
 	windowID       string
 	installationID string
-	// H: conditional codex CLI headers — forwarded verbatim (subagent /
-	// attestation, no cross-auth correlation risk by themselves) or derived
-	// (parent thread id, which is another thread_id and so must go through
-	// per-auth derivation to avoid leaking across pooled auths).
+	// H: conditional codex CLI headers — forwarded verbatim (subagent label,
+	// no cross-auth correlation risk by itself) or derived (parent thread id,
+	// which is another thread_id and so must go through per-auth derivation
+	// to avoid leaking across pooled auths).
 	subagent            string
 	parentThreadDerived string
-	attestation         string
 }
 
 // computeCodexFingerprintValues extracts inbound session_id / thread_id /
@@ -109,14 +110,25 @@ type codexFingerprintValues struct {
 // a single cache.ID), then runs each through the per-auth derive pipeline.
 func computeCodexFingerprintValues(ctx context.Context, body []byte, headers http.Header, auth *cliproxyauth.Auth) codexFingerprintValues {
 	var inboundSession, inboundThread, inboundWindow string
-	var inboundSubagent, inboundParentThread, inboundAttestation string
+	var inboundSubagent, inboundParentThread string
 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		inboundSession = strings.TrimSpace(ginCtx.GetHeader("Session_id"))
 		inboundThread = strings.TrimSpace(ginCtx.GetHeader("Thread_id"))
 		inboundWindow = strings.TrimSpace(ginCtx.GetHeader("X-Codex-Window-Id"))
 		inboundSubagent = strings.TrimSpace(ginCtx.GetHeader("X-Openai-Subagent"))
 		inboundParentThread = strings.TrimSpace(ginCtx.GetHeader("X-Codex-Parent-Thread-Id"))
-		inboundAttestation = strings.TrimSpace(ginCtx.GetHeader("X-Oai-Attestation"))
+		// X-Oai-Attestation is deliberately NOT read here.
+		//
+		// Attestation tokens are opaque per-request blobs signed by the
+		// client's attestation_provider, bound to that client's OAuth.
+		// In a pool deployment the inbound request and the chosen upstream
+		// auth (auth.Attributes.token) are typically different OAuths, so
+		// the forwarded attestation would (a) fail upstream validation if
+		// upstream checks token binding, and (b) appear identical across
+		// requests that the proxy dispatches to different auths — a clean
+		// cross-auth correlation signal. Real Codex CLI without an
+		// attestation provider configured also doesn't send the header,
+		// so absence is a valid client shape. Strip below.
 	}
 	// Non-codex paths: cacheHelper / applyCodexPromptCacheHeaders puts the
 	// synthesised cache.ID into the Session_id header and the body's
@@ -164,7 +176,6 @@ func computeCodexFingerprintValues(ctx context.Context, body []byte, headers htt
 		installationID:      codexInstallationIDForAuth(auth),
 		subagent:            inboundSubagent,
 		parentThreadDerived: parentDerived,
-		attestation:         inboundAttestation,
 	}
 }
 
@@ -219,7 +230,6 @@ func applyCodexFingerprintHeaders(headers http.Header, v codexFingerprintValues,
 		setHeader("x-codex-window-id", v.windowID)
 		setHeader("x-openai-subagent", v.subagent)
 		setHeader("x-codex-parent-thread-id", v.parentThreadDerived)
-		setHeader("x-oai-attestation", v.attestation)
 	} else {
 		setHeader("Session_id", v.sessionDerived)
 		setHeader("Thread_id", v.threadDerived)
@@ -227,7 +237,13 @@ func applyCodexFingerprintHeaders(headers http.Header, v codexFingerprintValues,
 		setHeader("X-Codex-Window-Id", v.windowID)
 		setHeader("X-Openai-Subagent", v.subagent)
 		setHeader("X-Codex-Parent-Thread-Id", v.parentThreadDerived)
-		setHeader("X-Oai-Attestation", v.attestation)
+	}
+	// Strip X-Oai-Attestation in any case variant. See computeCodexFingerprintValues
+	// for the audit reasoning (cross-auth identical attestation is a pool signal,
+	// and the token is signed against the inbound's OAuth which doesn't match the
+	// outbound auth in a pool deployment).
+	for _, key := range []string{"X-Oai-Attestation", "X-Oai-attestation", "x-oai-attestation"} {
+		headers.Del(key)
 	}
 	if compactPath && v.installationID != "" {
 		// Compact path is HTTP-only; lowercase variant never used here.

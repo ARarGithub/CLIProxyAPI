@@ -119,6 +119,11 @@ var genericNoiseFieldsAllowedIdentical = map[string]bool{
 	"X-Client-Request-Id":                   true,
 	"X-Responsesapi-Include-Timing-Metrics": true,
 	"Openai-Beta":                           true,
+	// X-Openai-Subagent is a small fixed enum (e.g. "review", "compact")
+	// indicating the subagent role for the request. Two pool dispatches of
+	// the same client's subagent flow naturally see the same label — not a
+	// per-account correlation signal.
+	"X-Openai-Subagent": true,
 }
 
 // bodyContentFieldsAllowedIdentical lists Codex /responses body keys that
@@ -394,11 +399,16 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 				}
 
 				// Conditional codex CLI headers (H/J): subagent / parent_thread_id
-				// / attestation must be present iff inbound carried them, and
-				// must NEVER be emitted on non-subagent / non-codex paths
-				// (constant emission would itself be a fingerprint). For the
+				// must be present iff inbound carried them, and must NEVER be
+				// emitted on non-subagent / non-codex paths (constant emission
+				// would itself be a fingerprint). Attestation is ALWAYS stripped
+				// regardless of inbound (cross-auth correlation risk + invalid
+				// binding when pool dispatches to a different OAuth). For the
 				// subagent scenario specifically, also verify parent_thread_id
 				// is per-auth derived (not the raw inbound value) and v7-shaped.
+				if got := rec.Headers.Get("X-Oai-Attestation"); got != "" {
+					t.Errorf("LEAK: X-Oai-Attestation = %q present — must always be stripped (cross-auth correlation risk)", got)
+				}
 				for _, c := range []struct {
 					name    string
 					inbound string
@@ -407,7 +417,6 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 				}{
 					{"X-Openai-Subagent", sc.ginHeaders["X-Openai-Subagent"], rec.Headers.Get("X-Openai-Subagent"), false},
 					{"X-Codex-Parent-Thread-Id", sc.ginHeaders["X-Codex-Parent-Thread-Id"], rec.Headers.Get("X-Codex-Parent-Thread-Id"), true},
-					{"X-Oai-Attestation", sc.ginHeaders["X-Oai-Attestation"], rec.Headers.Get("X-Oai-Attestation"), false},
 				} {
 					if c.inbound == "" {
 						if c.out != "" {

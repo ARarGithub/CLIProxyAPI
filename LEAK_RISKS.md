@@ -123,8 +123,11 @@ OpenAI 隨時可以對歷史日誌跑「同一 session_id 下出現 ≥2 個 acc
   - 修法：跟 L1 一樣經 `derivedThreadID(parent, auth)` 走 thread namespace 的 per-auth derive，輸出仍是合法 v7 UUID（timestamp 從 inbound v7 借）。
 
 - **`X-Oai-Attestation`**（attestation provider 啟用時）
-  - Real Codex CLI 是 opaque attestation token，per-request 變化。
-  - 從 inbound verbatim passthrough；沒 inbound 就不送。
+  - Real Codex CLI 是 opaque attestation token，per-request 變化，由客戶端的 `attestation_provider` 對該客戶端的 OAuth 簽出來。
+  - **不能 verbatim forward**，兩個原因：
+    1. **Cross-auth correlation 風險**：池化 deployment 下 inbound 跟最終分配到的上游 auth 不是同個 OAuth，但兩次 dispatch 同一個 inbound 會送出**完全相同**的 attestation token 配兩個不同 bearer → 上游把這兩個 OAuth join 起來。
+    2. **Binding 失敗**：attestation 通常綁定 OAuth；池化下我們配對的 bearer 跟 attestation 簽署目標不同 → 上游驗證會 fail（如果上游真的驗證）。
+  - 修法：**strip**（直接刪除 outbound 的 `X-Oai-Attestation` header，無論 inbound 有沒有）。Real Codex CLI 用戶若沒設 attestation provider 也不會送這條，所以 strip 後 fork 看起來像「沒設 attestation」的合法配置。
 
 - **WS path**：三條 header 都用 case-preserved lowercase 變體（`x-openai-subagent` etc.）以對齊 hyper 的 wire format。
 
@@ -144,7 +147,7 @@ OpenAI 隨時可以對歷史日誌跑「同一 session_id 下出現 ≥2 個 acc
 ## 🟠 L2：Codex `User-Agent` 寫死 macOS / arm64
 
 **嚴重度**：🟠 高（搭配 Linux/Windows 主機 IP 時 OS-mismatch）
-**狀態**：`[ ]`
+**狀態**：`[~]` 部分完成（config + inbound override 路徑已存在；只有兩者都空時才 fall back 到 hardcoded）
 **對應 checklist**：F1, F3
 
 ### 機制
@@ -153,22 +156,41 @@ OpenAI 隨時可以對歷史日誌跑「同一 session_id 下出現 ≥2 個 acc
 const codexUserAgent = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
 ```
 
-當部署在 Linux / Windows / amd64 主機（多數 VPS 場景）：
+實際優先序（`internal/runtime/executor/codex_websockets_executor.go:1012` 的 `ensureHeaderWithConfigPrecedence`）：
+
+1. **target 已有值** → 不動
+2. **config `codex-header-defaults.user-agent` 有設** → 用 config
+3. **inbound（gin headers）有 UA** → 用 inbound（codex direct path 把真實 client UA forward 過去）
+4. **都沒有** → 用 hardcoded fallback `codexUserAgent`
+
+也就是說：
+
+- 「config 有設」或「inbound 有 UA」時就**不會** emit hardcoded
+- 只有「config 沒設 + 非 codex direct path / inbound 沒 UA」時才 fall back 到 hardcoded
+- 對 API-key auth：`codexHeaderDefaults` 直接 return `""` → 跳過 config → 用 inbound 或 fallback
+
+當 fallback 觸發時的問題：
+
 - TCP/TLS 層暴露的 OS 訊號（如 TCP timestamp、TLS extension 順序）跟 UA 自稱的 macOS 不符
-- 多帳號從同一機器出去 → 全部都自稱 macOS arm64 + iTerm.app，但實際拓撲不可能這樣
+- 多帳號從同一機器出去 → 全部都自稱 macOS arm64 + iTerm.app
 - 寫死 `iTerm.app/3.6.9` 也是強指紋（真實 Codex CLI 的 terminal 段會跟使用者實際終端機一致）
+- `0.118.0` 是 stale 版本（截至 2026-05，real Codex CLI 的 release 已更新）
 
 ### 程式碼位置
-- `internal/runtime/executor/codex_executor.go:33`（const）
-- `internal/runtime/executor/codex_executor.go:788`（apply 處）
+- `internal/runtime/executor/codex_executor.go:33`（const fallback）
+- `internal/runtime/executor/codex_executor.go:810-811`（HTTP path：`codexHeaderDefaults` + `ensureHeaderWithConfigPrecedence`）
 - `internal/runtime/executor/codex_websockets_executor.go:847,866`（websocket apply）
-- `internal/runtime/executor/codex_executor.go:790-792` 對 Mac OS 子字串敏感（決定要不要塞隨機 `Session_id`）
+- `internal/runtime/executor/codex_websockets_executor.go:978`（`codexHeaderDefaults` 實作）
+- `internal/runtime/executor/codex_websockets_executor.go:1012`（`ensureHeaderWithConfigPrecedence` 實作）
+- `internal/runtime/executor/codex_executor.go:813`（apply 完後對 UA 內 `"Mac OS"` 子字串敏感 → 決定要不要塞 Session_id；現在已被 hardening 蓋掉，無實質影響）
 
-### 修復方向
-1. 用 `runtime.GOOS` / `runtime.GOARCH` 動態組 UA（mapping `darwin → "Mac OS X.Y"`、`linux → "Linux X.Y"`、`windows → "Windows X.Y"`）
+### 修復方向（fallback 還能更好）
+1. 用 `runtime.GOOS` / `runtime.GOARCH` 動態組 UA（mapping `darwin → "Mac OS X.Y"`、`linux → "Linux X.Y"`、`windows → "Windows X.Y"`），讓 fallback 至少跟主機 OS 一致
 2. 拿掉 terminal segment（`iTerm.app/3.6.9`）或讀環境變數 `TERM_PROGRAM` / `TERM`
-3. 同步調整 line 790 的「Mac OS 子字串檢查」邏輯（避免 macOS host 才生 Session_id 的隱性分支）
-4. 配合 config `codex-header-defaults.user-agent` 的 override（已存在）
+3. 把 fallback 版號改成讀取 build-time injected variable，每次升 Codex CLI 版號就跟著動
+
+### Pool 指紋影響
+**低**：real Codex CLI 在同一台機器跨 OAuth 帳號也是同 UA（單機多帳號合法）。所以「N 個 auth 共用同 UA」不能單獨判定為 pool；要搭配其它 per-auth 應該不同的欄位（L1 / F / G / H 等已 derive 過）一起看才有 signal。**proxy 偵測**才是 L2 主要風險點，不是 pool join。
 
 ---
 

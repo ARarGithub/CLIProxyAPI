@@ -451,10 +451,10 @@ func TestCodexFingerprintHardeningWS_DerivesSessionAndThreadPerAuth(t *testing.T
 }
 
 // TestCodexFingerprintHardeningWS_ConditionalHeaders_ForwardedFromInbound (H)
-// verifies the WS path forwards subagent / parent_thread_id / attestation
+// verifies the WS path forwards subagent + derives parent_thread_id per-auth
 // from inbound gin headers, using the lowercase header names real Codex CLI
-// emits over the websocket upgrade. parent_thread_id is per-auth derived to
-// avoid cross-auth leak; the other two are verbatim passthroughs.
+// emits over the websocket upgrade. Attestation is stripped — see
+// computeCodexFingerprintValues for the audit reasoning.
 func TestCodexFingerprintHardeningWS_ConditionalHeaders_ForwardedFromInbound(t *testing.T) {
 	inboundParent := uuid.Must(uuid.NewV7()).String()
 	recorder := httptest.NewRecorder()
@@ -475,8 +475,8 @@ func TestCodexFingerprintHardeningWS_ConditionalHeaders_ForwardedFromInbound(t *
 	if got := headerValueCaseInsensitive(headers, "x-openai-subagent"); got != "code-reviewer" {
 		t.Fatalf("x-openai-subagent = %q, want verbatim passthrough", got)
 	}
-	if got := headerValueCaseInsensitive(headers, "x-oai-attestation"); got != "attestation-token-xyz" {
-		t.Fatalf("x-oai-attestation = %q, want verbatim passthrough", got)
+	if got := headerValueCaseInsensitive(headers, "x-oai-attestation"); got != "" {
+		t.Fatalf("x-oai-attestation should be stripped on WS path; got %q", got)
 	}
 	parentOut := headerValueCaseInsensitive(headers, "x-codex-parent-thread-id")
 	if parentOut == "" {
@@ -485,9 +485,8 @@ func TestCodexFingerprintHardeningWS_ConditionalHeaders_ForwardedFromInbound(t *
 	if parentOut == inboundParent {
 		t.Fatalf("x-codex-parent-thread-id forwarded verbatim (%q); must be per-auth derived", parentOut)
 	}
-	// All three should land under their case-preserved lowercase keys (so
-	// hyper-style WS upgrades see them in canonical Codex form).
-	for _, lower := range []string{"x-openai-subagent", "x-codex-parent-thread-id", "x-oai-attestation"} {
+	// subagent + parent should land under case-preserved lowercase keys.
+	for _, lower := range []string{"x-openai-subagent", "x-codex-parent-thread-id"} {
 		if _, ok := headers[lower]; !ok {
 			t.Fatalf("expected case-preserved lowercase header %q in %#v", lower, headers)
 		}

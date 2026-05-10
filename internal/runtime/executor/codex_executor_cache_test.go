@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -310,11 +311,11 @@ func TestCodexFingerprintHardeningHTTP_BodyResetIsRetrySafe(t *testing.T) {
 
 // TestCodexFingerprintHardeningHTTP_ConditionalHeaders_ForwardedFromInbound
 // verifies H: when the inbound codex direct request carries the conditional
-// codex CLI headers (subagent / parent_thread_id / attestation), the hardening
-// hook forwards them to upstream — verbatim for subagent + attestation, and
-// per-auth derived for parent_thread_id. Real Codex CLI only emits these in
-// subagent flow / when an attestation provider is configured; the fork must
-// preserve that path when inbound has them.
+// codex CLI headers, the hardening hook forwards subagent verbatim and
+// derives parent_thread_id per-auth. Attestation is intentionally stripped
+// (see hardening hook audit note): a forwarded attestation token would be
+// cross-auth identical across pool dispatches of the same inbound, a clean
+// correlation signal; and it would fail upstream binding-validation anyway.
 func TestCodexFingerprintHardeningHTTP_ConditionalHeaders_ForwardedFromInbound(t *testing.T) {
 	inboundParent := uuid.Must(uuid.NewV7()).String()
 	recorder := httptest.NewRecorder()
@@ -337,8 +338,8 @@ func TestCodexFingerprintHardeningHTTP_ConditionalHeaders_ForwardedFromInbound(t
 	if got := r.Header.Get("X-Openai-Subagent"); got != "code-reviewer" {
 		t.Fatalf("X-Openai-Subagent = %q, want verbatim passthrough %q", got, "code-reviewer")
 	}
-	if got := r.Header.Get("X-Oai-Attestation"); got != "attestation-token-xyz" {
-		t.Fatalf("X-Oai-Attestation = %q, want verbatim passthrough", got)
+	if got := r.Header.Get("X-Oai-Attestation"); got != "" {
+		t.Fatalf("X-Oai-Attestation should be stripped (cross-auth correlation risk + invalid binding); got %q", got)
 	}
 	parentOut := r.Header.Get("X-Codex-Parent-Thread-Id")
 	if parentOut == "" {
@@ -361,7 +362,7 @@ func TestCodexFingerprintHardeningHTTP_ConditionalHeaders_ForwardedFromInbound(t
 // verifies that on non-codex / non-subagent paths, the hardening hook does
 // NOT synthesize the conditional headers. Real Codex CLI omits them outside
 // subagent flow; if we always emitted them, the constant-value pattern would
-// itself be a fingerprint.
+// itself be a fingerprint. Attestation is always absent regardless (stripped).
 func TestCodexFingerprintHardeningHTTP_ConditionalHeaders_AbsentWhenInboundAbsent(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
@@ -381,6 +382,40 @@ func TestCodexFingerprintHardeningHTTP_ConditionalHeaders_AbsentWhenInboundAbsen
 	for _, h := range []string{"X-Openai-Subagent", "X-Codex-Parent-Thread-Id", "X-Oai-Attestation"} {
 		if got := r.Header.Get(h); got != "" {
 			t.Errorf("%s should be absent on non-codex/non-subagent path; got %q", h, got)
+		}
+	}
+}
+
+// TestCodexFingerprintHardeningHTTP_Attestation_StrippedEvenWhenInboundPresent
+// guards the attestation-strip invariant: even if inbound carries the header,
+// the hardening hook MUST drop it. See computeCodexFingerprintValues for
+// reasoning.
+func TestCodexFingerprintHardeningHTTP_Attestation_StrippedEvenWhenInboundPresent(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
+	ginCtx.Request.Header.Set("X-Oai-Attestation", "attestation-token-xyz")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	url := "https://example.com/responses"
+	r := newPostCacheHelperRequest(t, ctx, url, "")
+	// Pre-populate the outbound header to verify hardening strips even what
+	// upstream might have copied through. Use multiple case variants — Go's
+	// http.Header canonicalises on Set, but lowercase + mixed forms may
+	// survive in test scaffolding.
+	r.Header.Set("X-Oai-Attestation", "attestation-token-xyz")
+	if err := applyCodexFingerprintHardeningHTTP(ctx, r, auth, url); err != nil {
+		t.Fatalf("hardening: %v", err)
+	}
+	if got := r.Header.Get("X-Oai-Attestation"); got != "" {
+		t.Fatalf("X-Oai-Attestation must be stripped, got %q", got)
+	}
+	for k := range r.Header {
+		if strings.EqualFold(k, "x-oai-attestation") {
+			t.Errorf("found attestation-like header %q in output; must be stripped", k)
 		}
 	}
 }
