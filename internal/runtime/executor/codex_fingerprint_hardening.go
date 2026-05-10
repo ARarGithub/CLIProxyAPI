@@ -83,13 +83,24 @@ func applyCodexFingerprintHardeningWS(ctx context.Context, body []byte, headers 
 }
 
 // codexFingerprintValues holds the derived fields that get written to the
-// outgoing request. All four must be either all empty or all set; in
-// practice they're produced together from one auth + one inbound snapshot.
+// outgoing request. The first four (session/thread/window/installation) are
+// always produced; the conditional family (subagent / parentThread /
+// attestation) is only populated when the inbound request actually carries
+// them. Real Codex CLI only emits the conditional headers in subagent flow
+// or when an attestation provider is configured — synthesizing them on
+// non-codex paths would itself be a fingerprint.
 type codexFingerprintValues struct {
 	sessionDerived string
 	threadDerived  string
 	windowID       string
 	installationID string
+	// H: conditional codex CLI headers — forwarded verbatim (subagent /
+	// attestation, no cross-auth correlation risk by themselves) or derived
+	// (parent thread id, which is another thread_id and so must go through
+	// per-auth derivation to avoid leaking across pooled auths).
+	subagent            string
+	parentThreadDerived string
+	attestation         string
 }
 
 // computeCodexFingerprintValues extracts inbound session_id / thread_id /
@@ -98,10 +109,14 @@ type codexFingerprintValues struct {
 // a single cache.ID), then runs each through the per-auth derive pipeline.
 func computeCodexFingerprintValues(ctx context.Context, body []byte, headers http.Header, auth *cliproxyauth.Auth) codexFingerprintValues {
 	var inboundSession, inboundThread, inboundWindow string
+	var inboundSubagent, inboundParentThread, inboundAttestation string
 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		inboundSession = strings.TrimSpace(ginCtx.GetHeader("Session_id"))
 		inboundThread = strings.TrimSpace(ginCtx.GetHeader("Thread_id"))
 		inboundWindow = strings.TrimSpace(ginCtx.GetHeader("X-Codex-Window-Id"))
+		inboundSubagent = strings.TrimSpace(ginCtx.GetHeader("X-Openai-Subagent"))
+		inboundParentThread = strings.TrimSpace(ginCtx.GetHeader("X-Codex-Parent-Thread-Id"))
+		inboundAttestation = strings.TrimSpace(ginCtx.GetHeader("X-Oai-Attestation"))
 	}
 	// Non-codex paths: cacheHelper / applyCodexPromptCacheHeaders puts the
 	// synthesised cache.ID into the Session_id header and the body's
@@ -121,20 +136,45 @@ func computeCodexFingerprintValues(ctx context.Context, body []byte, headers htt
 	if inboundThread == "" {
 		inboundThread = inboundSession
 	}
+	// WS body's client_metadata may carry the conditional fields even when
+	// the gin headers didn't (e.g., a codex direct WS path where the upstream
+	// upgrade routed through a body-only injection). Fall back to body lookups
+	// for symmetry with HTTP. Real Codex CLI emits both header AND body, so
+	// gin-header-first preserves the standard case.
+	if inboundSubagent == "" {
+		if v := gjson.GetBytes(body, "client_metadata.x-openai-subagent"); v.Exists() {
+			inboundSubagent = strings.TrimSpace(v.String())
+		}
+	}
+	if inboundParentThread == "" {
+		if v := gjson.GetBytes(body, "client_metadata.x-codex-parent-thread-id"); v.Exists() {
+			inboundParentThread = strings.TrimSpace(v.String())
+		}
+	}
 
 	threadDerived := derivedThreadID(inboundThread, auth)
+	var parentDerived string
+	if inboundParentThread != "" {
+		parentDerived = derivedThreadID(inboundParentThread, auth)
+	}
 	return codexFingerprintValues{
-		sessionDerived: derivedSessionID(inboundSession, auth),
-		threadDerived:  threadDerived,
-		windowID:       codexWindowID(threadDerived, parseInboundWindowGeneration(inboundWindow)),
-		installationID: codexInstallationIDForAuth(auth),
+		sessionDerived:      derivedSessionID(inboundSession, auth),
+		threadDerived:       threadDerived,
+		windowID:            codexWindowID(threadDerived, parseInboundWindowGeneration(inboundWindow)),
+		installationID:      codexInstallationIDForAuth(auth),
+		subagent:            inboundSubagent,
+		parentThreadDerived: parentDerived,
+		attestation:         inboundAttestation,
 	}
 }
 
 // applyCodexFingerprintBody writes the derived prompt_cache_key (= thread)
 // and client_metadata.x-codex-installation-id into a request body. WS path
 // also writes client_metadata.x-codex-window-id (real Codex CLI's WS body
-// carries it; HTTP body does not).
+// carries it; HTTP body does not) and the derived
+// client_metadata.x-codex-parent-thread-id (conditional, only in subagent
+// flow). The verbatim conditional fields (subagent label, turn metadata) are
+// left as-is; they ride through from the inbound body without rewrite.
 func applyCodexFingerprintBody(body []byte, v codexFingerprintValues, includeWindowID bool) []byte {
 	if v.threadDerived != "" {
 		body, _ = sjson.SetBytes(body, "prompt_cache_key", v.threadDerived)
@@ -145,6 +185,9 @@ func applyCodexFingerprintBody(body []byte, v codexFingerprintValues, includeWin
 	if includeWindowID && v.windowID != "" {
 		body, _ = sjson.SetBytes(body, "client_metadata.x-codex-window-id", v.windowID)
 	}
+	if includeWindowID && v.parentThreadDerived != "" {
+		body, _ = sjson.SetBytes(body, "client_metadata.x-codex-parent-thread-id", v.parentThreadDerived)
+	}
 	return body
 }
 
@@ -153,6 +196,11 @@ func applyCodexFingerprintBody(body []byte, v codexFingerprintValues, includeWin
 // a header (real Codex CLI's compact route is the only HTTP path that does
 // this). lowercaseKeys=true uses the case-preserved lowercase header names
 // real Codex CLI emits over the websocket upgrade.
+//
+// Conditional headers (subagent / parent_thread_id / attestation) are only
+// emitted when the inbound carries them. Real Codex CLI gates these on
+// subagent flow / attestation provider config — emitting them unconditionally
+// on every request would itself be a fingerprint.
 func applyCodexFingerprintHeaders(headers http.Header, v codexFingerprintValues, compactPath, lowercaseKeys bool) {
 	setHeader := func(name, value string) {
 		if value == "" {
@@ -169,11 +217,17 @@ func applyCodexFingerprintHeaders(headers http.Header, v codexFingerprintValues,
 		setHeader("thread_id", v.threadDerived)
 		setHeader("x-client-request-id", v.threadDerived)
 		setHeader("x-codex-window-id", v.windowID)
+		setHeader("x-openai-subagent", v.subagent)
+		setHeader("x-codex-parent-thread-id", v.parentThreadDerived)
+		setHeader("x-oai-attestation", v.attestation)
 	} else {
 		setHeader("Session_id", v.sessionDerived)
 		setHeader("Thread_id", v.threadDerived)
 		setHeader("X-Client-Request-Id", v.threadDerived)
 		setHeader("X-Codex-Window-Id", v.windowID)
+		setHeader("X-Openai-Subagent", v.subagent)
+		setHeader("X-Codex-Parent-Thread-Id", v.parentThreadDerived)
+		setHeader("X-Oai-Attestation", v.attestation)
 	}
 	if compactPath && v.installationID != "" {
 		// Compact path is HTTP-only; lowercase variant never used here.

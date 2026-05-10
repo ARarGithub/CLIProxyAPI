@@ -157,9 +157,9 @@ WS request body 的 `client_metadata` 比 HTTP 更豐富：
 | `x-codex-beta-features` | All paths | 由 config 決定的字串 | `state.beta_features_header`（從 config 讀） | per process | `core/src/client.rs:175`+`1654-1659` | ✅（fork 從 ginHeaders / config 帶過去） |
 | `x-codex-turn-state` | All paths | per-turn 字串 | `turn_state.get()`（OnceLock） | per turn | `core/src/client.rs:1660-1665` | ✅（fork 從 ginHeaders 帶） |
 | `x-codex-turn-metadata` | All paths | per-turn 字串 | `turn_metadata_header` 參數 | per turn | `core/src/client.rs:1666-1668` | ✅（fork 從 ginHeaders 帶） |
-| `x-codex-parent-thread-id` | All paths（subagent flow only） | thread_id 字串 | `parent_thread_id_header_value(session_source)` | conditional：subagent 流程才有 | `core/src/client.rs:614-617` | ⚠️ H 待做（codex direct 應 forward；非 codex 不送） |
-| `x-openai-subagent` | All paths（subagent flow only） | subagent 標籤字串（如 `"review"` `"compact"`） | `subagent_header_value(session_source)` | conditional | `core/src/client.rs:1672-1690` | ⚠️ H 待做 |
-| `x-oai-attestation` | All paths（attestation provider 啟用時） | 設備驗證簽章字串 | `attestation_provider.header_for_request().await` | per request；需要 attestation 配置 | `core/src/client.rs:501-503`+`908-910` | ⚠️ H 待做 |
+| `x-codex-parent-thread-id` | All paths（subagent flow only） | thread_id 字串 | `parent_thread_id_header_value(session_source)` | conditional：subagent 流程才有 | `core/src/client.rs:614-617` | ✅ H 完成（per-auth `derivedThreadID` 避免 cross-pool 同 parent leak；HTTP/WS 都送） |
+| `x-openai-subagent` | All paths（subagent flow only） | subagent 標籤字串（如 `"review"` `"compact"`） | `subagent_header_value(session_source)` | conditional | `core/src/client.rs:1672-1690` | ✅ H 完成（verbatim passthrough from inbound；無 inbound 就不送） |
+| `x-oai-attestation` | All paths（attestation provider 啟用時） | 設備驗證簽章字串 | `attestation_provider.header_for_request().await` | per request；需要 attestation 配置 | `core/src/client.rs:501-503`+`908-910` | ✅ H 完成（verbatim passthrough；無 inbound 就不送） |
 | `x-responsesapi-include-timing-metrics` | WS（HTTP 也有但 WS 更常用） | `"true"` | 固定字串，當 `state.include_timing_metrics` 為 true 時加 | per process | `core/src/client.rs:915-919` | ✅（fork 從 ginHeaders 帶） |
 | `OpenAI-Beta` | HTTP=`responses=v1`；WS=`responses_websockets=2026-02-06` | 固定字串 | 寫死 const，路徑差別 | const | `core/src/client.rs:145`、`912-914` | ✅ |
 | `User-Agent` | All paths | `codex_cli_rs/X.Y.Z (OS; arch) terminal/X.Y.Z` | 動態組（runtime.GOOS/GOARCH + version + terminal env） | per process | `core/src/client.rs`（透過 transport）；版本 const | ⚠️ L2：fork 預設寫死 macOS/arm64，靠 config override |
@@ -326,19 +326,28 @@ if promptCacheKey.Exists() {
 - WS body 的 `client_metadata.x-codex-window-id` 也寫（real WS client_metadata 比 HTTP 豐富）
 - 詳見 `LEAK_RISKS.md` F + G 段落、`internal/runtime/executor/codex_installation_id.go`
 
-**H. Subagent / parent_thread_id / attestation**
-- 這些都是 conditional headers（subagent flow / attestation provider 啟用時才有）
-- 對 fork 來說：codex direct path 的 ginHeaders 有就 forward；非 codex 路徑 don't add（多送反而是 fingerprint）
-- 確認 codex direct path 的這幾個 header 有正確 forward（目前 fork 只 forward 一些 X-Codex-* 系列）
+**H. Subagent / parent_thread_id / attestation** — ✅ **已完成 2026-05-11**
+- 在 hardening hook 內讀 inbound gin headers 的 `X-Openai-Subagent` / `X-Codex-Parent-Thread-Id` / `X-Oai-Attestation`，沒有就不送（real client 也不送）
+- `X-Openai-Subagent` / `X-Oai-Attestation`：verbatim passthrough（label / opaque token，本身無 cross-auth correlation 風險）
+- `X-Codex-Parent-Thread-Id`：per-auth derive 經 `derivedThreadID(parent, auth)`，避免 pooled auths 同一 parent 被關聯
+- WS path 用 lowercase 變體（`x-openai-subagent` etc.）
+- 詳見 `internal/runtime/executor/codex_fingerprint_hardening.go` 的 `applyCodexFingerprintHeaders` + `computeCodexFingerprintValues`
 
-**I. WS body `client_metadata` 多欄位處理**
-- WS path 的 client_metadata 比 HTTP 多 window_id、subagent、parent_thread_id、turn_metadata
-- 取決於 F + G + H 怎麼做
+**I. WS body `client_metadata` 多欄位處理** — ✅ **已完成 2026-05-11**
+- `client_metadata.x-codex-installation-id` ← F 處理
+- `client_metadata.x-codex-window-id` ← G 處理（WS only）
+- `client_metadata.x-codex-parent-thread-id` ← hardening 從 inbound gin header 或 body 讀，derive，寫回 body（subagent flow only）
+- `client_metadata.x-openai-subagent` / `.x-codex-turn-metadata` ← passthrough（hardening 不動，sjson.SetBytes 只動指定 key，其它條件欄位順著 inbound 過去）
+- 對 codex direct WS：translator 把 inbound body 透過去 → 上述欄位都會在 hardening 看到
+- 對非 codex WS：translator 不 synthesize → 上述條件欄位都不會出現（real client 也不在）
+- 測試見 `TestCodexFingerprintHardeningWS_ClientMetadata_*` 4 條
 
-**J. 驗證 fork 的 body 有沒有保留 client_metadata field**
-- 對 codex direct path，translator 是否把整個 body 透過去？包含 client_metadata？
-- 對非 codex path，translator synthesize 的 body 應該完全沒有這個 field
-- 用 fingerprint regression test 加一條 assertion：「body 必有 `client_metadata.x-codex-installation-id`」即可監控
+**J. 驗證 fork 的 body 有沒有保留 client_metadata field** — ✅ **已完成 2026-05-11**
+- fingerprint regression test 多三條斷言：
+  - body 必有 `client_metadata.x-codex-installation-id`（已在 F 完成時加）
+  - 每個 record 對 `X-Openai-Subagent` / `X-Codex-Parent-Thread-Id` / `X-Oai-Attestation` 三條：「inbound 有 → outbound 有 + parent 必 derive；inbound 無 → outbound 必無」（否則就是 constant fingerprint）
+  - 新增 `crossAuthLeakFields` entry：`X-Codex-Parent-Thread-Id` (header) + `client_metadata.x-codex-parent-thread-id` (body)
+- 新 scenario `codex_direct_with_subagent_flow` 覆蓋 subagent flow path
 
 ### 對應的 doc 更新（隨 D-J 進行）
 
@@ -430,3 +439,4 @@ curl -s 'https://raw.githubusercontent.com/openai/codex/main/codex-rs/protocol/s
 | 2026-05-11 | 完成 §6 D（拆兩個 derive stream）+ E（移除 Conversation_id header）。L1 patch 從「single derive 寫兩處」改成「session 跟 thread 兩個 namespace 各自 derive、寫入對應 header / body」。新增 `Thread_id` / `X-Client-Request-Id` headers。完整測試套件更新（cross-stream distinctness、Conversation_id absent、Thread_id == prompt_cache_key 等斷言）。 | main HEAD |
 | 2026-05-11 | 完成 §6 F（per-auth installation_id v4 持久化 + body/compact header 注入）+ G（x-codex-window-id 從 derived thread + parsed generation 拼出，HTTP/WS 都送，WS body client_metadata 也補）。新增 13 條 helper 單元測試 + regression test 4 條 F/G 結構性斷言 + cross-auth leak fields 加 X-Codex-Window-Id 與 client_metadata.x-codex-installation-id。 | main HEAD |
 | 2026-05-11 | **重構**：把所有 fingerprint hardening 從 4 個 upstream-controlled 函式抽到單一檔案 `internal/runtime/executor/codex_fingerprint_hardening.go`。`cacheHelper` / `applyCodexHeaders` / `applyCodexPromptCacheHeaders` / `applyCodexWebsocketHeaders` 全部 revert 到 upstream 原版，每條 outbound 路徑後面只多 1 行 `applyCodexFingerprintHardeningHTTP` / `WS` 呼叫（HTTP 3 個 callsite + WS 2 個 callsite）。Conversation_id 從「不送」改成「送了再 strip」以保持 upstream 函式完全 untouched。MERGE_GUIDE Mode C 改寫，未來 upstream 改 cacheHelper / applyCodexHeaders 的 body 邏輯通常不需做事。Test 套件全綠（Mode C 不再衝突，merge 成本顯著降低）。 | main HEAD |
+| 2026-05-11 | 完成 §6 H / I / J。新增 conditional codex CLI headers 處理：`X-Openai-Subagent` / `X-Oai-Attestation` verbatim passthrough（純 label / opaque token，無 cross-auth 風險）；`X-Codex-Parent-Thread-Id` per-auth derive（避免 pooled auths 同 parent 被關聯）。WS path 用 lowercase 變體 + WS body 的 `client_metadata.x-codex-parent-thread-id` 也 derive、其它 `client_metadata` 條件欄位（subagent / turn_metadata）passthrough。Regression test 新增 `codex_direct_with_subagent_flow` scenario + per-record conditional header invariant assertion（inbound 有→outbound 有 + parent 必 derive；inbound 無→outbound 必無）+ crossAuthLeakFields 加 `X-Codex-Parent-Thread-Id` 與 `client_metadata.x-codex-parent-thread-id`。+8 條測試（HTTP 3、WS 5），共 50 條 fingerprint 相關測試全綠。 | main HEAD |

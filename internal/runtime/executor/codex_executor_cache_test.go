@@ -307,3 +307,116 @@ func TestCodexFingerprintHardeningHTTP_BodyResetIsRetrySafe(t *testing.T) {
 	}
 	_ = time.Now // silence unused import if we trim other deps later
 }
+
+// TestCodexFingerprintHardeningHTTP_ConditionalHeaders_ForwardedFromInbound
+// verifies H: when the inbound codex direct request carries the conditional
+// codex CLI headers (subagent / parent_thread_id / attestation), the hardening
+// hook forwards them to upstream — verbatim for subagent + attestation, and
+// per-auth derived for parent_thread_id. Real Codex CLI only emits these in
+// subagent flow / when an attestation provider is configured; the fork must
+// preserve that path when inbound has them.
+func TestCodexFingerprintHardeningHTTP_ConditionalHeaders_ForwardedFromInbound(t *testing.T) {
+	inboundParent := uuid.Must(uuid.NewV7()).String()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
+	ginCtx.Request.Header.Set("X-Openai-Subagent", "code-reviewer")
+	ginCtx.Request.Header.Set("X-Codex-Parent-Thread-Id", inboundParent)
+	ginCtx.Request.Header.Set("X-Oai-Attestation", "attestation-token-xyz")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	url := "https://example.com/responses"
+	r := newPostCacheHelperRequest(t, ctx, url, "" /*codex direct path*/)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, r, auth, url); err != nil {
+		t.Fatalf("hardening: %v", err)
+	}
+
+	if got := r.Header.Get("X-Openai-Subagent"); got != "code-reviewer" {
+		t.Fatalf("X-Openai-Subagent = %q, want verbatim passthrough %q", got, "code-reviewer")
+	}
+	if got := r.Header.Get("X-Oai-Attestation"); got != "attestation-token-xyz" {
+		t.Fatalf("X-Oai-Attestation = %q, want verbatim passthrough", got)
+	}
+	parentOut := r.Header.Get("X-Codex-Parent-Thread-Id")
+	if parentOut == "" {
+		t.Fatal("X-Codex-Parent-Thread-Id should be forwarded when inbound has it")
+	}
+	if parentOut == inboundParent {
+		t.Fatalf("X-Codex-Parent-Thread-Id forwarded verbatim (%q); must be per-auth derived to avoid cross-auth leak", parentOut)
+	}
+	assertLooksLikeRealCodexSessionID(t, parentOut)
+
+	// The hardening derive maps (parent, auth) deterministically into the
+	// thread namespace, so this should equal derivedThreadID(parent, auth).
+	want := derivedThreadID(inboundParent, auth)
+	if parentOut != want {
+		t.Fatalf("X-Codex-Parent-Thread-Id = %q, want derivedThreadID(parent, auth) = %q", parentOut, want)
+	}
+}
+
+// TestCodexFingerprintHardeningHTTP_ConditionalHeaders_AbsentWhenInboundAbsent
+// verifies that on non-codex / non-subagent paths, the hardening hook does
+// NOT synthesize the conditional headers. Real Codex CLI omits them outside
+// subagent flow; if we always emitted them, the constant-value pattern would
+// itself be a fingerprint.
+func TestCodexFingerprintHardeningHTTP_ConditionalHeaders_AbsentWhenInboundAbsent(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
+	ginCtx.Set("userApiKey", "test-api-key")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	url := "https://example.com/responses"
+	r := newPostCacheHelperRequest(t, ctx, url, "cache-1" /*non-codex synthesis*/)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, r, auth, url); err != nil {
+		t.Fatalf("hardening: %v", err)
+	}
+
+	for _, h := range []string{"X-Openai-Subagent", "X-Codex-Parent-Thread-Id", "X-Oai-Attestation"} {
+		if got := r.Header.Get(h); got != "" {
+			t.Errorf("%s should be absent on non-codex/non-subagent path; got %q", h, got)
+		}
+	}
+}
+
+// TestCodexFingerprintHardeningHTTP_ParentThreadID_DerivedPerAuth verifies the
+// L1 invariant extends to parent_thread_id: two different auths sharing the
+// same inbound parent must end up with different derived values upstream.
+// Otherwise pooled accounts in a subagent flow could be correlated.
+func TestCodexFingerprintHardeningHTTP_ParentThreadID_DerivedPerAuth(t *testing.T) {
+	inboundParent := uuid.Must(uuid.NewV7()).String()
+
+	doOnce := func(authID string) string {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Request = httptest.NewRequest("POST", "/", nil)
+		ginCtx.Request.Header.Set("X-Codex-Parent-Thread-Id", inboundParent)
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+		auth := &cliproxyauth.Auth{ID: authID}
+		ensureCodexInstallationID(auth)
+		url := "https://example.com/responses"
+		r := newPostCacheHelperRequest(t, ctx, url, "")
+		if err := applyCodexFingerprintHardeningHTTP(ctx, r, auth, url); err != nil {
+			t.Fatalf("hardening (%s): %v", authID, err)
+		}
+		return r.Header.Get("X-Codex-Parent-Thread-Id")
+	}
+
+	a := doOnce("auth-A")
+	b := doOnce("auth-B")
+	if a == "" || b == "" {
+		t.Fatalf("parent_thread_id missing: a=%q b=%q", a, b)
+	}
+	if a == b {
+		t.Fatalf("LEAK: X-Codex-Parent-Thread-Id identical across auth-A and auth-B (%q)", a)
+	}
+	if a == inboundParent || b == inboundParent {
+		t.Fatalf("parent_thread_id forwarded verbatim — must be per-auth derived")
+	}
+}

@@ -108,6 +108,37 @@ OpenAI 隨時可以對歷史日誌跑「同一 session_id 下出現 ≥2 個 acc
 
 - 測試：`codex_installation_id_test.go`（13 個 case）+ regression test 加 4 條斷言（body 必有 v4 installation_id、header 必有 `{uuid}:{int}` 形狀 window_id、thread 部分必須等於 Thread_id、cross-auth 全不同）。`crossAuthLeakFields` 加上 `X-Codex-Window-Id` 與 `client_metadata.x-codex-installation-id`。
 
+### H — Conditional codex CLI headers（subagent / parent_thread_id / attestation，2026-05-11）
+
+延續 L1 + E 的雙重原則「per-auth derive 避免關聯」 + 「不送 real client 不送的、不漏 real client 會送的」，補完三條 conditional headers：
+
+- **`X-Openai-Subagent`**（subagent flow only）
+  - Real Codex CLI 在 subagent 流程才送，值是 subagent 標籤字串（如 `"review"` / `"compact"`）。
+  - 純標籤、無 cross-auth correlation 風險 → 從 inbound `gin.Context` 讀，verbatim passthrough。
+  - 沒 inbound 就不送（否則「永遠送同樣字串」反而成 fingerprint）。
+
+- **`X-Codex-Parent-Thread-Id`**（subagent flow only）
+  - Real Codex CLI 是父 thread 的 thread_id 字串（v7 UUID）。
+  - 直接 forward 會有 cross-auth correlation 風險：兩個 pooled auths 收到同一個 client 的 subagent flow 時，parent_thread_id 會相同 → 上游 join 起來就知道是同一 pool。
+  - 修法：跟 L1 一樣經 `derivedThreadID(parent, auth)` 走 thread namespace 的 per-auth derive，輸出仍是合法 v7 UUID（timestamp 從 inbound v7 借）。
+
+- **`X-Oai-Attestation`**（attestation provider 啟用時）
+  - Real Codex CLI 是 opaque attestation token，per-request 變化。
+  - 從 inbound verbatim passthrough；沒 inbound 就不送。
+
+- **WS path**：三條 header 都用 case-preserved lowercase 變體（`x-openai-subagent` etc.）以對齊 hyper 的 wire format。
+
+- **WS body `client_metadata` 多欄位**（I）：
+  - `client_metadata.x-codex-parent-thread-id`：跟 header 同步 derive，兩處寫一樣的字串（符合 real Codex CLI 行為）。
+  - `client_metadata.x-openai-subagent` / `.x-codex-turn-metadata`：hardening 不動，passthrough（sjson.SetBytes 只動指定 key）。
+
+- **注入點**：全部在 `internal/runtime/executor/codex_fingerprint_hardening.go` 的 `computeCodexFingerprintValues` + `applyCodexFingerprintHeaders` + `applyCodexFingerprintBody`。
+
+- 測試（J）：
+  - 新單元測試 8 條：HTTP `_ConditionalHeaders_ForwardedFromInbound` / `_AbsentWhenInboundAbsent` / `_ParentThreadID_DerivedPerAuth`；WS 同三條 + `_ClientMetadata_ParentThreadIDDerived` / `_FromBody` / `_PassthroughFields`。
+  - regression test 新增 `codex_direct_with_subagent_flow` scenario，per-record 加「inbound 有 → outbound 有 + parent 必 derive；inbound 無 → outbound 必無」斷言；`crossAuthLeakFields` 加 `X-Codex-Parent-Thread-Id` 與 `client_metadata.x-codex-parent-thread-id`。
+  - 共 50 條 fingerprint 相關測試全綠。
+
 ---
 
 ## 🟠 L2：Codex `User-Agent` 寫死 macOS / arm64

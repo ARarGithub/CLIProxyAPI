@@ -82,9 +82,11 @@ var crossAuthLeakFields = []fingerprintField{
 	{inHeader, "thread_id", "Codex thread identifier (lowercase, WS)"},
 	{inHeader, "X-Client-Request-Id", "Codex per-thread request id (= thread_id in real Codex CLI)"},
 	{inHeader, "X-Codex-Window-Id", "Codex window id (= thread_id : generation; thread part must differ across auths)"},
+	{inHeader, "X-Codex-Parent-Thread-Id", "Codex parent thread identifier (subagent flow); must be per-auth derived to prevent cross-pool correlation"},
 	{inBody, "prompt_cache_key", "Codex prompt cache key (= thread_id in real Codex CLI)"},
 	{inBody, "previous_response_id", "Trivially correlates conversation turns across accounts"},
 	{inBody, "client_metadata.x-codex-installation-id", "Per-install UUIDv4; sharing across accounts identifies single-machine pool"},
+	{inBody, "client_metadata.x-codex-parent-thread-id", "Codex parent thread identifier in WS client_metadata (subagent flow)"},
 }
 
 // crossAuthMustDifferFields are fields the test EXPECTS to differ across
@@ -155,6 +157,11 @@ type fingerprintScenario struct {
 	ginHeaders    map[string]string
 	inboundAPIKey string
 }
+
+// codexV7Fixture is a freshly-minted UUIDv7 used as inbound parent_thread_id
+// in subagent-flow scenarios. Generated at package init so the v7 timestamp
+// is "now" and the v7 mimic check (≤ 30 days old) always passes.
+var codexV7Fixture = uuid.Must(uuid.NewV7()).String()
 
 func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T) {
 	var (
@@ -239,6 +246,17 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 			from:          sdktranslator.FromString("codex"),
 			clientPayload: `{"model":"gpt-5-codex","input":"hello"}`,
 			ginHeaders:    map[string]string{"Session_id": "client-session-XYZ"},
+		},
+		{
+			name:          "codex_direct_with_subagent_flow",
+			from:          sdktranslator.FromString("codex"),
+			clientPayload: `{"model":"gpt-5-codex","input":"hello"}`,
+			ginHeaders: map[string]string{
+				"Session_id":               "client-session-XYZ",
+				"X-Openai-Subagent":        "code-reviewer",
+				"X-Codex-Parent-Thread-Id": codexV7Fixture,
+				"X-Oai-Attestation":        "attestation-token-xyz",
+			},
 		},
 		{
 			name:          "openai_response_with_prompt_cache_key",
@@ -372,6 +390,42 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 						if widGen == "" {
 							t.Errorf("MALFORMED: X-Codex-Window-Id = %q has empty generation suffix", wid)
 						}
+					}
+				}
+
+				// Conditional codex CLI headers (H/J): subagent / parent_thread_id
+				// / attestation must be present iff inbound carried them, and
+				// must NEVER be emitted on non-subagent / non-codex paths
+				// (constant emission would itself be a fingerprint). For the
+				// subagent scenario specifically, also verify parent_thread_id
+				// is per-auth derived (not the raw inbound value) and v7-shaped.
+				for _, c := range []struct {
+					name    string
+					inbound string
+					out     string
+					derive  bool
+				}{
+					{"X-Openai-Subagent", sc.ginHeaders["X-Openai-Subagent"], rec.Headers.Get("X-Openai-Subagent"), false},
+					{"X-Codex-Parent-Thread-Id", sc.ginHeaders["X-Codex-Parent-Thread-Id"], rec.Headers.Get("X-Codex-Parent-Thread-Id"), true},
+					{"X-Oai-Attestation", sc.ginHeaders["X-Oai-Attestation"], rec.Headers.Get("X-Oai-Attestation"), false},
+				} {
+					if c.inbound == "" {
+						if c.out != "" {
+							t.Errorf("LEAK: %s = %q emitted with no inbound (would be a constant fingerprint)", c.name, c.out)
+						}
+						continue
+					}
+					if c.out == "" {
+						t.Errorf("MISSING: inbound %s = %q present but outbound is empty", c.name, c.inbound)
+						continue
+					}
+					if c.derive {
+						if c.out == c.inbound {
+							t.Errorf("LEAK: %s forwarded verbatim (%q); must be per-auth derived", c.name, c.out)
+						}
+						assertCodexV7Mimic(t, "header "+c.name, c.out)
+					} else if c.out != c.inbound {
+						t.Errorf("INCONSISTENT: %s = %q, want verbatim passthrough of inbound %q", c.name, c.out, c.inbound)
 					}
 				}
 			}

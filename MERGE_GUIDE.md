@@ -50,6 +50,10 @@
 | **`X-Codex-Window-Id` 的 thread 部分跨 auth 必不同** | `crossAuthLeakFields` 內條目 |
 | **codex 直連路徑保留 inbound `X-Codex-Window-Id` 的 generation 數字** | `computeCodexFingerprintValues` 內 `parseInboundWindowGeneration(...)`；`TestCodexWindowID_RoundTripGenerationFromInbound` |
 | **httpReq.Body 重置後 GetBody 也重設**（讓 Go transport 可 retry） | `resetRequestBody` 設 `httpReq.GetBody`；`TestCodexFingerprintHardeningHTTP_BodyResetIsRetrySafe` |
+| **Conditional codex CLI headers**（`X-Openai-Subagent` / `X-Codex-Parent-Thread-Id` / `X-Oai-Attestation`）只在 inbound 有時 forward | `applyCodexFingerprintHeaders` 內三個 `setHeader` 呼叫；regression test 內 per-record 條件斷言；`TestCodexFingerprintHardeningHTTP_ConditionalHeaders_ForwardedFromInbound` / `_AbsentWhenInboundAbsent` |
+| **`X-Codex-Parent-Thread-Id` 必 per-auth derive**（不可 verbatim forward） | `computeCodexFingerprintValues` 內 `derivedThreadID(inboundParent, auth)`；`TestCodexFingerprintHardeningHTTP_ParentThreadID_DerivedPerAuth`；regression test `crossAuthLeakFields` 內 `X-Codex-Parent-Thread-Id` + `client_metadata.x-codex-parent-thread-id` 條目 |
+| **WS body `client_metadata.x-codex-parent-thread-id` 與 header `x-codex-parent-thread-id` 同值**（real Codex CLI 兩處同字串） | `applyCodexFingerprintBody` + `applyCodexFingerprintHeaders`；`TestCodexFingerprintHardeningWS_ClientMetadata_ParentThreadIDDerived` |
+| **WS body `client_metadata.x-openai-subagent` / `.x-codex-turn-metadata` 是 passthrough**（hardening 不動，sjson 只動指定 key） | `TestCodexFingerprintHardeningWS_ClientMetadata_PassthroughFields` |
 
 ### L4 不變式
 
@@ -333,5 +337,9 @@ go test ./internal/runtime/executor/ -run 'TestDerivePerAuthSessionID' -v
 | 2026-05-10 | 初版 L1 patch + 回歸測試 | `39e7cd91` |
 | 2026-05-10 | 第一次 merge upstream（v6→v7、apiKey→userApiKey）；衝突解在 `codex_executor_cache_test.go` | merge commit `7f59970a` |
 | 2026-05-10 | L4 patch（隨機 lead + persistence + jitter） | `db489fb8` |
+| 2026-05-11 | L1 拆兩 stream（D）+ 移除 Conversation_id（E） | `1df53cd5` |
+| 2026-05-11 | 新增 F（per-auth installation_id）+ G（x-codex-window-id） | `85214cd0` |
+| 2026-05-11 | 重構：fingerprint hardening 集中到 `codex_fingerprint_hardening.go`；upstream 函式全 revert | `4f3165aa` |
+| 2026-05-11 | H 完成：conditional codex headers（subagent / parent_thread_id / attestation）；I 完成：WS client_metadata 多欄位處理（parent derive、其它 passthrough）；J 完成：regression test 加 subagent scenario 與 per-record conditional invariants | TBD |
 
 未來每次 merge 完更新一行：日期 + merge 帶進來的 upstream 版本 + 解過的衝突類別（對照 §4 Mode A-G）+ commit hash。

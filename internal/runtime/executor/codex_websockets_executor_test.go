@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -349,9 +350,17 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 // pre/post invariants below correspond to what real upstream sees.
 func hardenWS(t *testing.T, from sdktranslator.Format, payload []byte, body []byte, auth *cliproxyauth.Auth) ([]byte, http.Header) {
 	t.Helper()
+	return hardenWSWithCtx(t, context.Background(), from, payload, body, auth)
+}
+
+// hardenWSWithCtx is the gin-aware variant, used by tests that want to assert
+// behavior of inbound headers / body fields the codex direct path would
+// supply via the gin request.
+func hardenWSWithCtx(t *testing.T, ctx context.Context, from sdktranslator.Format, payload []byte, body []byte, auth *cliproxyauth.Auth) ([]byte, http.Header) {
+	t.Helper()
 	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: payload}
 	body, headers := applyCodexPromptCacheHeaders(from, req, body)
-	body, headers = applyCodexFingerprintHardeningWS(context.Background(), body, headers, auth)
+	body, headers = applyCodexFingerprintHardeningWS(ctx, body, headers, auth)
 	return body, headers
 }
 
@@ -438,6 +447,172 @@ func TestCodexFingerprintHardeningWS_DerivesSessionAndThreadPerAuth(t *testing.T
 	// WS body's client_metadata also carries window_id (mirror real client).
 	if wsWidA != widA {
 		t.Fatalf("WS body client_metadata.x-codex-window-id (%q) must equal header X-Codex-Window-Id (%q)", wsWidA, widA)
+	}
+}
+
+// TestCodexFingerprintHardeningWS_ConditionalHeaders_ForwardedFromInbound (H)
+// verifies the WS path forwards subagent / parent_thread_id / attestation
+// from inbound gin headers, using the lowercase header names real Codex CLI
+// emits over the websocket upgrade. parent_thread_id is per-auth derived to
+// avoid cross-auth leak; the other two are verbatim passthroughs.
+func TestCodexFingerprintHardeningWS_ConditionalHeaders_ForwardedFromInbound(t *testing.T) {
+	inboundParent := uuid.Must(uuid.NewV7()).String()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
+	ginCtx.Request.Header.Set("X-Openai-Subagent", "code-reviewer")
+	ginCtx.Request.Header.Set("X-Codex-Parent-Thread-Id", inboundParent)
+	ginCtx.Request.Header.Set("X-Oai-Attestation", "attestation-token-xyz")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	_, headers := hardenWSWithCtx(t, ctx, "codex",
+		[]byte(`{"model":"gpt-5-codex","input":"hi"}`),
+		[]byte(`{"model":"gpt-5-codex"}`), auth)
+
+	if got := headerValueCaseInsensitive(headers, "x-openai-subagent"); got != "code-reviewer" {
+		t.Fatalf("x-openai-subagent = %q, want verbatim passthrough", got)
+	}
+	if got := headerValueCaseInsensitive(headers, "x-oai-attestation"); got != "attestation-token-xyz" {
+		t.Fatalf("x-oai-attestation = %q, want verbatim passthrough", got)
+	}
+	parentOut := headerValueCaseInsensitive(headers, "x-codex-parent-thread-id")
+	if parentOut == "" {
+		t.Fatal("x-codex-parent-thread-id should be forwarded when inbound has it")
+	}
+	if parentOut == inboundParent {
+		t.Fatalf("x-codex-parent-thread-id forwarded verbatim (%q); must be per-auth derived", parentOut)
+	}
+	// All three should land under their case-preserved lowercase keys (so
+	// hyper-style WS upgrades see them in canonical Codex form).
+	for _, lower := range []string{"x-openai-subagent", "x-codex-parent-thread-id", "x-oai-attestation"} {
+		if _, ok := headers[lower]; !ok {
+			t.Fatalf("expected case-preserved lowercase header %q in %#v", lower, headers)
+		}
+	}
+}
+
+// TestCodexFingerprintHardeningWS_ConditionalHeaders_AbsentWhenInboundAbsent
+// verifies the non-subagent / non-codex case: no inbound conditional headers
+// → no outbound conditional headers (otherwise their constant emission would
+// be a fingerprint).
+func TestCodexFingerprintHardeningWS_ConditionalHeaders_AbsentWhenInboundAbsent(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	_, headers := hardenWS(t, "openai-response",
+		[]byte(`{"prompt_cache_key":"cache-1"}`),
+		[]byte(`{"model":"gpt-5-codex"}`), auth)
+
+	for _, h := range []string{"x-openai-subagent", "x-codex-parent-thread-id", "x-oai-attestation"} {
+		if got := headerValueCaseInsensitive(headers, h); got != "" {
+			t.Errorf("%s should be absent on non-subagent path; got %q", h, got)
+		}
+		if _, ok := headers[h]; ok {
+			t.Errorf("%s should be absent from header keys on non-subagent path", h)
+		}
+	}
+}
+
+// TestCodexFingerprintHardeningWS_ClientMetadata_ParentThreadIDDerived (I)
+// verifies the WS body's client_metadata.x-codex-parent-thread-id is also
+// per-auth derived. Real Codex CLI puts this in BOTH the header and the WS
+// body's client_metadata when in subagent flow — the fork must derive both
+// consistently (= same derived value).
+func TestCodexFingerprintHardeningWS_ClientMetadata_ParentThreadIDDerived(t *testing.T) {
+	inboundParent := uuid.Must(uuid.NewV7()).String()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
+	ginCtx.Request.Header.Set("X-Codex-Parent-Thread-Id", inboundParent)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	body, headers := hardenWSWithCtx(t, ctx, "codex",
+		[]byte(`{"model":"gpt-5-codex","input":"hi"}`),
+		[]byte(`{"model":"gpt-5-codex"}`), auth)
+
+	bodyParent := gjson.GetBytes(body, "client_metadata.x-codex-parent-thread-id").String()
+	headerParent := headerValueCaseInsensitive(headers, "x-codex-parent-thread-id")
+	if bodyParent == "" {
+		t.Fatal("WS body client_metadata.x-codex-parent-thread-id should be set when inbound has parent_thread_id")
+	}
+	if bodyParent == inboundParent {
+		t.Fatalf("client_metadata.x-codex-parent-thread-id forwarded verbatim (%q); must be derived", bodyParent)
+	}
+	if bodyParent != headerParent {
+		t.Fatalf("WS body parent (%q) != header parent (%q); real Codex CLI sets both to the same value", bodyParent, headerParent)
+	}
+}
+
+// TestCodexFingerprintHardeningWS_ClientMetadata_PassthroughFields (I)
+// verifies the WS body's conditional client_metadata fields (subagent label,
+// turn metadata) are preserved verbatim through the hardening hook. Real
+// Codex CLI emits these in subagent / per-turn flows; the fork must not
+// rewrite them. installation_id, window_id, parent_thread_id are handled
+// elsewhere — this test guards the "everything else just rides through" path.
+func TestCodexFingerprintHardeningWS_ClientMetadata_PassthroughFields(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	inputBody := []byte(`{` +
+		`"model":"gpt-5-codex",` +
+		`"prompt_cache_key":"cache-1",` +
+		`"client_metadata":{` +
+		`"x-openai-subagent":"code-reviewer",` +
+		`"x-codex-turn-metadata":"{\"turn_id\":\"turn-1\"}"` +
+		`}}`)
+
+	body, _ := hardenWS(t, "openai-response",
+		[]byte(`{"model":"gpt-5-codex","input":"hi","prompt_cache_key":"cache-1"}`),
+		inputBody, auth)
+
+	if got := gjson.GetBytes(body, "client_metadata.x-openai-subagent").String(); got != "code-reviewer" {
+		t.Fatalf("client_metadata.x-openai-subagent = %q, want %q (passthrough)", got, "code-reviewer")
+	}
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String(); got != `{"turn_id":"turn-1"}` {
+		t.Fatalf("client_metadata.x-codex-turn-metadata = %q, want passthrough", got)
+	}
+	// The mandatory fields hardening adds must still be present alongside the
+	// preserved passthroughs.
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); got == "" {
+		t.Fatal("client_metadata.x-codex-installation-id must remain set")
+	}
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); got == "" {
+		t.Fatal("client_metadata.x-codex-window-id must remain set")
+	}
+}
+
+// TestCodexFingerprintHardeningWS_ClientMetadata_ParentThreadIDFromBody (I)
+// verifies the body-only path: if inbound carries parent_thread_id in the WS
+// client_metadata but not in the gin headers, the hardening hook still picks
+// it up, derives, and writes it back.
+func TestCodexFingerprintHardeningWS_ClientMetadata_ParentThreadIDFromBody(t *testing.T) {
+	inboundParent := uuid.Must(uuid.NewV7()).String()
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	// Construct a WS body that already carries parent_thread_id in its
+	// client_metadata (no gin header). The hardening should pick it up from
+	// the body.
+	inputBody := []byte(`{"model":"gpt-5-codex","client_metadata":{"x-codex-parent-thread-id":"` + inboundParent + `"}}`)
+	body, headers := hardenWS(t, "codex",
+		[]byte(`{"model":"gpt-5-codex","input":"hi"}`),
+		inputBody, auth)
+
+	bodyParent := gjson.GetBytes(body, "client_metadata.x-codex-parent-thread-id").String()
+	if bodyParent == "" {
+		t.Fatal("expected derived parent_thread_id in body when inbound body had it")
+	}
+	if bodyParent == inboundParent {
+		t.Fatalf("forwarded verbatim from body; must be derived")
+	}
+	if got := headerValueCaseInsensitive(headers, "x-codex-parent-thread-id"); got != bodyParent {
+		t.Fatalf("body-sourced parent should also propagate to header (%q vs body %q)", got, bodyParent)
 	}
 }
 
