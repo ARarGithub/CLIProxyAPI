@@ -187,11 +187,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body, auth)
+	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
 	if err != nil {
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, httpReq, auth, url); err != nil {
+		return resp, err
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -338,11 +341,14 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body, auth)
+	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
 	if err != nil {
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, httpReq, auth, url); err != nil {
+		return resp, err
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -436,11 +442,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body, auth)
+	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
 	if err != nil {
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, httpReq, auth, url); err != nil {
+		return nil, err
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -744,7 +753,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	return auth, nil
 }
 
-func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte, auth *cliproxyauth.Auth) (*http.Request, error) {
+func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
 	var cache helps.CodexCache
 	if from == "claude" {
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
@@ -770,76 +779,15 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		}
 	}
 
-	// For codex direct path, real Codex CLI sends DISTINCT session_id and
-	// thread_id headers (plus thread_id is also the body's prompt_cache_key).
-	// Extract them separately so the two derive streams below can carry the
-	// inbound timestamps independently. For non-codex paths the synthesised
-	// cache.ID is used for both streams (the namespace separation in
-	// derive*ID guarantees the outputs differ).
-	sessionInput, threadInput := cache.ID, cache.ID
-	if cache.ID == "" {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			sessionInput = strings.TrimSpace(ginCtx.GetHeader("Session_id"))
-			threadInput = strings.TrimSpace(ginCtx.GetHeader("Thread_id"))
-		}
-		if threadInput == "" {
-			if pck := gjson.GetBytes(rawJSON, "prompt_cache_key"); pck.Exists() {
-				if pckStr := strings.TrimSpace(pck.String()); pckStr != "" {
-					threadInput = pckStr
-				}
-			}
-		}
-		if sessionInput == "" {
-			sessionInput = threadInput
-		}
-		if threadInput == "" {
-			threadInput = sessionInput
-		}
-	}
-
-	sessionDerived := derivedSessionID(sessionInput, auth)
-	threadDerived := derivedThreadID(threadInput, auth)
-
-	// LEAK_RISKS.md F + G + CODEX_CLI_REFERENCE.md §6.F/§6.G:
-	// - body's client_metadata.x-codex-installation-id always carries a stable
-	//   per-auth UUIDv4 (real Codex CLI sends one per install).
-	// - x-codex-window-id is "{thread_id}:{generation}". For the codex direct
-	//   path the inbound generation is preserved; otherwise 0 (mimic a fresh
-	//   websocket session that has not been reset).
-	installationID := codexInstallationIDForAuth(auth)
-	var windowGeneration uint64
-	if cache.ID == "" {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			windowGeneration = parseInboundWindowGeneration(ginCtx.GetHeader("X-Codex-Window-Id"))
-		}
-	}
-	windowID := codexWindowID(threadDerived, windowGeneration)
-
-	if threadDerived != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", threadDerived)
-	}
-	if installationID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", installationID)
+	if cache.ID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, err
 	}
-	if sessionDerived != "" {
-		httpReq.Header.Set("Session_id", sessionDerived)
-	}
-	if threadDerived != "" {
-		httpReq.Header.Set("Thread_id", threadDerived)
-		httpReq.Header.Set("X-Client-Request-Id", threadDerived)
-	}
-	if windowID != "" {
-		httpReq.Header.Set("X-Codex-Window-Id", windowID)
-	}
-	if installationID != "" && strings.Contains(url, "/responses/compact") {
-		// Real Codex CLI's compact path additionally carries installation_id
-		// as a header (see codex-rs/core/src/client.rs:487-490). Standard
-		// /responses keeps it in the body only.
-		httpReq.Header.Set("X-Codex-Installation-Id", installationID)
+	if cache.ID != "" {
+		httpReq.Header.Set("Session_id", cache.ID)
 	}
 	return httpReq, nil
 }
@@ -858,28 +806,12 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	// X-Client-Request-Id: cacheHelper writes the per-auth derived thread id
-	// here. Only fall back to ginHeaders if cacheHelper did not. (Mirrors the
-	// Session_id pattern below — never let misc.EnsureHeader clobber a derived
-	// value with the raw inbound, which would leak the cross-auth correlation.)
-	if strings.TrimSpace(r.Header.Get("X-Client-Request-Id")) == "" {
-		misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	}
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 
 	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		// cacheHelper has already set Session_id and Thread_id (with per-auth
-		// derivation) for any request where a session source existed. Only fall
-		// back to fresh UUIDs when nothing is set — never let misc.EnsureHeader
-		// pull raw inbound values and clobber the derived ones, which would
-		// re-leak the cross-auth correlation. See LEAK_RISKS.md L1.
-		if strings.TrimSpace(r.Header.Get("Session_id")) == "" {
-			r.Header.Set("Session_id", uuid.NewString())
-		}
-		if strings.TrimSpace(r.Header.Get("Thread_id")) == "" {
-			r.Header.Set("Thread_id", uuid.NewString())
-		}
+		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
 	}
 
 	if stream {

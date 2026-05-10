@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -10,8 +12,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -19,131 +19,154 @@ import (
 // derived Session_id / Thread_id / prompt_cache_key (cross-auth distinct,
 // within-auth stable, valid v7 UUID with recent timestamp, Session_id !=
 // prompt_cache_key) rather than hardcoding a specific SHA1-derived value.
-// The derive algorithm is allowed to change as long as these properties hold.
+//
+// Tests exercise applyCodexFingerprintHardeningHTTP — the single hook that
+// runs after upstream's cacheHelper + applyCodexHeaders have built httpReq.
+// Each test mints a synthetic post-cacheHelper httpReq (body + Session_id
+// header pre-populated to mimic what upstream's cacheHelper would have done
+// for the corresponding `from` path) and asserts what hardening overrides.
 
-func TestCodexExecutorCacheHelper_OpenAIChat_StableWithinAuth(t *testing.T) {
+// newPostCacheHelperRequest builds the httpReq state we'd see right after
+// upstream's cacheHelper returns, ready to be passed to the hardening hook.
+//
+// upstreamCacheID mirrors what upstream's cacheHelper put into the body's
+// prompt_cache_key and the Session_id header for non-codex paths. For the
+// codex direct path pass "" — the inbound session/thread are then taken from
+// gin context only.
+func newPostCacheHelperRequest(t *testing.T, ctx context.Context, url string, upstreamCacheID string) *http.Request {
+	t.Helper()
+	body := []byte(`{"model":"gpt-5.3-codex","stream":true}`)
+	if upstreamCacheID != "" {
+		// Mimic upstream's cacheHelper sjson.SetBytes(prompt_cache_key).
+		body = []byte(`{"model":"gpt-5.3-codex","stream":true,"prompt_cache_key":"` + upstreamCacheID + `"}`)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build httpReq: %v", err)
+	}
+	if upstreamCacheID != "" {
+		httpReq.Header.Set("Session_id", upstreamCacheID)
+	}
+	return httpReq
+}
+
+func TestCodexFingerprintHardeningHTTP_OpenAIChat_StableWithinAuth(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
 	ginCtx.Set("userApiKey", "test-api-key")
-
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
-	executor := &CodexExecutor{}
-	rawJSON := []byte(`{"model":"gpt-5.3-codex","stream":true}`)
-	req := cliproxyexecutor.Request{
-		Model:   "gpt-5.3-codex",
-		Payload: []byte(`{"model":"gpt-5.3-codex"}`),
-	}
-	url := "https://example.com/responses"
+
 	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
 
-	httpReq1, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON, auth)
-	if err != nil {
-		t.Fatalf("cacheHelper error: %v", err)
+	cacheID := "shared-cache-id-from-upstream-cacheHelper"
+	url := "https://example.com/responses"
+
+	r1 := newPostCacheHelperRequest(t, ctx, url, cacheID)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, r1, auth, url); err != nil {
+		t.Fatalf("hardening error: %v", err)
 	}
-	body1, _ := io.ReadAll(httpReq1.Body)
-	sid1 := httpReq1.Header.Get("Session_id")
-	tid1 := httpReq1.Header.Get("Thread_id")
-	xrid1 := httpReq1.Header.Get("X-Client-Request-Id")
+	body1, _ := io.ReadAll(r1.Body)
+	sid1 := r1.Header.Get("Session_id")
+	tid1 := r1.Header.Get("Thread_id")
+	xrid1 := r1.Header.Get("X-Client-Request-Id")
 	pck1 := gjson.GetBytes(body1, "prompt_cache_key").String()
+	inst1 := gjson.GetBytes(body1, "client_metadata.x-codex-installation-id").String()
 
-	for _, v := range []string{sid1, tid1, xrid1, pck1} {
+	for _, v := range []string{sid1, tid1, xrid1, pck1, inst1} {
 		if v == "" {
-			t.Fatalf("missing required value: sid=%q tid=%q xrid=%q pck=%q", sid1, tid1, xrid1, pck1)
+			t.Fatalf("missing required value: sid=%q tid=%q xrid=%q pck=%q inst=%q", sid1, tid1, xrid1, pck1, inst1)
 		}
 	}
 	if sid1 == pck1 {
 		t.Fatalf("Session_id (%q) == prompt_cache_key — real Codex CLI never makes them equal", sid1)
 	}
 	if tid1 != pck1 {
-		t.Fatalf("Thread_id (%q) must equal prompt_cache_key (%q) — real Codex CLI uses thread_id as prompt_cache_key", tid1, pck1)
+		t.Fatalf("Thread_id (%q) must equal prompt_cache_key (%q)", tid1, pck1)
 	}
 	if xrid1 != tid1 {
-		t.Fatalf("X-Client-Request-Id (%q) must equal Thread_id (%q) — real Codex CLI uses thread_id as x-client-request-id", xrid1, tid1)
+		t.Fatalf("X-Client-Request-Id (%q) must equal Thread_id (%q)", xrid1, tid1)
 	}
 	assertLooksLikeRealCodexSessionID(t, sid1)
 	assertLooksLikeRealCodexSessionID(t, tid1)
 
-	httpReq2, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON, auth)
-	if err != nil {
-		t.Fatalf("cacheHelper error (second call): %v", err)
+	// Second call with same auth + same cacheID must produce the same outputs.
+	r2 := newPostCacheHelperRequest(t, ctx, url, cacheID)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, r2, auth, url); err != nil {
+		t.Fatalf("hardening error (2nd): %v", err)
 	}
-	if sid2 := httpReq2.Header.Get("Session_id"); sid1 != sid2 {
-		t.Fatalf("Session_id must be stable across calls with same auth: %q vs %q", sid1, sid2)
+	if sid2 := r2.Header.Get("Session_id"); sid1 != sid2 {
+		t.Fatalf("Session_id must be stable across calls: %q vs %q", sid1, sid2)
 	}
-	if tid2 := httpReq2.Header.Get("Thread_id"); tid1 != tid2 {
-		t.Fatalf("Thread_id must be stable across calls with same auth: %q vs %q", tid1, tid2)
+	if tid2 := r2.Header.Get("Thread_id"); tid1 != tid2 {
+		t.Fatalf("Thread_id must be stable across calls: %q vs %q", tid1, tid2)
 	}
 }
 
-func TestCodexExecutorCacheHelper_PerAuthSessionIDDiffersAcrossAuths(t *testing.T) {
+func TestCodexFingerprintHardeningHTTP_PerAuthDiffersAcrossAuths(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
 	ginCtx.Set("userApiKey", "test-api-key")
-
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
-	executor := &CodexExecutor{}
-	rawJSON := []byte(`{"model":"gpt-5.3-codex","stream":true}`)
-	req := cliproxyexecutor.Request{
-		Model:   "gpt-5.3-codex",
-		Payload: []byte(`{"model":"gpt-5.3-codex"}`),
-	}
-	url := "https://example.com/responses"
 
 	authA := &cliproxyauth.Auth{ID: "auth-A"}
 	authB := &cliproxyauth.Auth{ID: "auth-B"}
+	ensureCodexInstallationID(authA)
+	ensureCodexInstallationID(authB)
 
-	reqA, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON, authA)
-	if err != nil {
-		t.Fatalf("cacheHelper(authA) error: %v", err)
+	url := "https://example.com/responses"
+	cacheID := "shared-cache-id"
+
+	rA := newPostCacheHelperRequest(t, ctx, url, cacheID)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, rA, authA, url); err != nil {
+		t.Fatalf("hardening error (A): %v", err)
 	}
-	reqB, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON, authB)
-	if err != nil {
-		t.Fatalf("cacheHelper(authB) error: %v", err)
+	rB := newPostCacheHelperRequest(t, ctx, url, cacheID)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, rB, authB, url); err != nil {
+		t.Fatalf("hardening error (B): %v", err)
 	}
 
-	bodyA, _ := io.ReadAll(reqA.Body)
-	bodyB, _ := io.ReadAll(reqB.Body)
-	sidA, sidB := reqA.Header.Get("Session_id"), reqB.Header.Get("Session_id")
-	tidA, tidB := reqA.Header.Get("Thread_id"), reqB.Header.Get("Thread_id")
+	bodyA, _ := io.ReadAll(rA.Body)
+	bodyB, _ := io.ReadAll(rB.Body)
+	sidA, sidB := rA.Header.Get("Session_id"), rB.Header.Get("Session_id")
+	tidA, tidB := rA.Header.Get("Thread_id"), rB.Header.Get("Thread_id")
 	pckA := gjson.GetBytes(bodyA, "prompt_cache_key").String()
 	pckB := gjson.GetBytes(bodyB, "prompt_cache_key").String()
+	instA := gjson.GetBytes(bodyA, "client_metadata.x-codex-installation-id").String()
+	instB := gjson.GetBytes(bodyB, "client_metadata.x-codex-installation-id").String()
 
-	for _, v := range []string{sidA, sidB, tidA, tidB, pckA, pckB} {
+	for _, v := range []string{sidA, sidB, tidA, tidB, pckA, pckB, instA, instB} {
 		if v == "" {
-			t.Fatalf("missing required value: sidA=%q sidB=%q tidA=%q tidB=%q pckA=%q pckB=%q", sidA, sidB, tidA, tidB, pckA, pckB)
+			t.Fatalf("missing required value")
 		}
 	}
 	if sidA == sidB {
-		t.Fatalf("Session_id leaked across auths: A=B=%q", sidA)
+		t.Fatalf("Session_id leaked across auths: %q", sidA)
 	}
 	if tidA == tidB {
-		t.Fatalf("Thread_id leaked across auths: A=B=%q", tidA)
+		t.Fatalf("Thread_id leaked across auths: %q", tidA)
 	}
 	if pckA == pckB {
-		t.Fatalf("prompt_cache_key leaked across auths: A=B=%q", pckA)
+		t.Fatalf("prompt_cache_key leaked across auths: %q", pckA)
+	}
+	if instA == instB {
+		t.Fatalf("installation_id leaked across auths: %q", instA)
 	}
 	if sidA == tidA || sidB == tidB {
-		t.Fatalf("Session_id == Thread_id (A: %q vs %q; B: %q vs %q) — real Codex CLI never makes them equal", sidA, tidA, sidB, tidB)
+		t.Fatalf("Session_id == Thread_id (real Codex CLI never makes them equal)")
 	}
 	if pckA != tidA || pckB != tidB {
-		t.Fatalf("prompt_cache_key must equal Thread_id (A: %q vs %q; B: %q vs %q)", pckA, tidA, pckB, tidB)
+		t.Fatalf("prompt_cache_key must equal Thread_id")
 	}
-	assertLooksLikeRealCodexSessionID(t, sidA)
-	assertLooksLikeRealCodexSessionID(t, sidB)
-	assertLooksLikeRealCodexSessionID(t, tidA)
-	assertLooksLikeRealCodexSessionID(t, tidB)
 }
 
-func TestCodexExecutorCacheHelper_DirectCodex_MirrorsInboundV7Timestamp(t *testing.T) {
-	// Codex CLI sends a fresh UUIDv7 per session_id AND another fresh UUIDv7
-	// per thread_id (two independent client-side now_v7() calls). The proxy
-	// must produce derived UUIDs that:
-	//   (a) borrow each inbound v7's timestamp into the corresponding stream
-	//       (Session_id derived borrows from inbound Session_id, Thread_id
-	//       derived borrows from inbound Thread_id);
-	//   (b) differ across auths in the random portion;
-	//   (c) NEVER pass the raw inbound through;
-	//   (d) keep Session_id != Thread_id (they're different streams).
+func TestCodexFingerprintHardeningHTTP_DirectCodex_MirrorsInboundV7Timestamp(t *testing.T) {
+	// Real Codex CLI sends two distinct UUIDv7s as session_id and thread_id
+	// headers. The hardening must extract each, derive a per-auth v7 that
+	// preserves the corresponding inbound timestamp, and never let the raw
+	// inbound value reach upstream.
 	inboundSessionV7 := uuid.Must(uuid.NewV7()).String()
 	inboundThreadV7 := uuid.Must(uuid.NewV7()).String()
 	if inboundSessionV7 == inboundThreadV7 {
@@ -155,92 +178,132 @@ func TestCodexExecutorCacheHelper_DirectCodex_MirrorsInboundV7Timestamp(t *testi
 	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
 	ginCtx.Request.Header.Set("Session_id", inboundSessionV7)
 	ginCtx.Request.Header.Set("Thread_id", inboundThreadV7)
-
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
-	executor := &CodexExecutor{}
-	rawJSON := []byte(`{"model":"gpt-5.3-codex"}`)
-	req := cliproxyexecutor.Request{Model: "gpt-5.3-codex", Payload: []byte(`{}`)}
-	url := "https://example.com/responses"
 
 	authA := &cliproxyauth.Auth{ID: "auth-A"}
 	authB := &cliproxyauth.Auth{ID: "auth-B"}
+	ensureCodexInstallationID(authA)
+	ensureCodexInstallationID(authB)
 
-	reqA, err := executor.cacheHelper(ctx, sdktranslator.FromString("codex"), url, req, rawJSON, authA)
-	if err != nil {
-		t.Fatalf("cacheHelper(authA) error: %v", err)
+	url := "https://example.com/responses"
+	rA := newPostCacheHelperRequest(t, ctx, url, "" /*codex direct: no upstream cache.ID*/)
+	if err := applyCodexFingerprintHardeningHTTP(ctx, rA, authA, url); err != nil {
+		t.Fatalf("hardening error (A): %v", err)
 	}
-	reqB, err := executor.cacheHelper(ctx, sdktranslator.FromString("codex"), url, req, rawJSON, authB)
-	if err != nil {
-		t.Fatalf("cacheHelper(authB) error: %v", err)
+	rB := newPostCacheHelperRequest(t, ctx, url, "")
+	if err := applyCodexFingerprintHardeningHTTP(ctx, rB, authB, url); err != nil {
+		t.Fatalf("hardening error (B): %v", err)
 	}
 
-	sidA, sidB := reqA.Header.Get("Session_id"), reqB.Header.Get("Session_id")
-	tidA, tidB := reqA.Header.Get("Thread_id"), reqB.Header.Get("Thread_id")
+	sidA, sidB := rA.Header.Get("Session_id"), rB.Header.Get("Session_id")
+	tidA, tidB := rA.Header.Get("Thread_id"), rB.Header.Get("Thread_id")
 
-	for _, v := range []string{sidA, sidB, tidA, tidB} {
-		if v == "" {
-			t.Fatalf("missing required value: sidA=%q sidB=%q tidA=%q tidB=%q", sidA, sidB, tidA, tidB)
-		}
-	}
 	for _, raw := range []string{inboundSessionV7, inboundThreadV7} {
 		if sidA == raw || sidB == raw || tidA == raw || tidB == raw {
-			t.Fatalf("direct path forwarded raw client v7 without derivation (raw=%q)", raw)
+			t.Fatalf("hardening forwarded raw inbound v7 (%q)", raw)
 		}
 	}
-	if sidA == sidB {
-		t.Fatalf("session stream leaked across auths: %q", sidA)
-	}
-	if tidA == tidB {
-		t.Fatalf("thread stream leaked across auths: %q", tidA)
+	if sidA == sidB || tidA == tidB {
+		t.Fatalf("cross-auth leaked")
 	}
 	if sidA == tidA || sidB == tidB {
-		t.Fatalf("Session_id == Thread_id within one auth (A: %q vs %q; B: %q vs %q)", sidA, tidA, sidB, tidB)
+		t.Fatalf("Session_id == Thread_id within an auth")
 	}
 
 	for _, v := range []string{sidA, sidB, tidA, tidB} {
 		assertLooksLikeRealCodexSessionID(t, v)
 	}
 
-	// Cross-stream timestamp mirroring: each derived stream's timestamp must
-	// match the corresponding inbound stream's timestamp.
 	wantSessionTS := extractV7TimestampMs(uuid.MustParse(inboundSessionV7))
 	wantThreadTS := extractV7TimestampMs(uuid.MustParse(inboundThreadV7))
 	for _, sid := range []string{sidA, sidB} {
-		if gotTS := extractV7TimestampMs(uuid.MustParse(sid)); gotTS != wantSessionTS {
-			t.Errorf("session stream timestamp %d does not match inbound session %d (sid=%s)", gotTS, wantSessionTS, sid)
+		if got := extractV7TimestampMs(uuid.MustParse(sid)); got != wantSessionTS {
+			t.Errorf("session stream timestamp %d != inbound session %d", got, wantSessionTS)
 		}
 	}
 	for _, tid := range []string{tidA, tidB} {
-		if gotTS := extractV7TimestampMs(uuid.MustParse(tid)); gotTS != wantThreadTS {
-			t.Errorf("thread stream timestamp %d does not match inbound thread %d (tid=%s)", gotTS, wantThreadTS, tid)
+		if got := extractV7TimestampMs(uuid.MustParse(tid)); got != wantThreadTS {
+			t.Errorf("thread stream timestamp %d != inbound thread %d", got, wantThreadTS)
 		}
 	}
 }
 
-// assertLooksLikeRealCodexSessionID verifies the derived session_id passes the
-// trivial structural checks that the upstream Codex API could perform: parses
-// as a UUID, has the expected version (defaulting to 7), and (for v7) carries
-// a timestamp within a plausible recent window.
-func assertLooksLikeRealCodexSessionID(t *testing.T, sid string) {
-	t.Helper()
-	u, err := uuid.Parse(sid)
+func TestCodexFingerprintHardeningHTTP_CompactPath_AddsInstallationIDHeader(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
+	ginCtx.Set("userApiKey", "test-api-key")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+	wantInst, _ := auth.Metadata["installation_id"].(string)
+
+	for _, tc := range []struct {
+		name   string
+		url    string
+		expect bool
+	}{
+		{"compact path", "https://example.com/responses/compact", true},
+		{"standard path", "https://example.com/responses", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPostCacheHelperRequest(t, ctx, tc.url, "cache-1")
+			if err := applyCodexFingerprintHardeningHTTP(ctx, r, auth, tc.url); err != nil {
+				t.Fatalf("hardening error: %v", err)
+			}
+			got := r.Header.Get("X-Codex-Installation-Id")
+			if tc.expect {
+				if got != wantInst {
+					t.Fatalf("compact path: X-Codex-Installation-Id = %q, want %q", got, wantInst)
+				}
+			} else {
+				if got != "" {
+					t.Fatalf("standard path: X-Codex-Installation-Id should be empty, got %q", got)
+				}
+			}
+		})
+	}
+}
+
+func TestCodexFingerprintHardeningHTTP_BodyResetIsRetrySafe(t *testing.T) {
+	// httpReq.GetBody must produce a fresh reader so the Go transport can
+	// retry idempotent requests after early connection close.
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
+	ginCtx.Set("userApiKey", "test-api-key")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	url := "https://example.com/responses"
+	r := newPostCacheHelperRequest(t, ctx, url, "cache-1")
+	if err := applyCodexFingerprintHardeningHTTP(ctx, r, auth, url); err != nil {
+		t.Fatalf("hardening error: %v", err)
+	}
+	if r.GetBody == nil {
+		t.Fatal("GetBody should be set after hardening")
+	}
+	first, err := r.GetBody()
 	if err != nil {
-		t.Fatalf("derived session_id %q is not a valid UUID: %v", sid, err)
+		t.Fatalf("GetBody (1st): %v", err)
 	}
-	if v := u.Version(); byte(v) != 7 {
-		t.Fatalf("derived session_id %q has version %d, want 7 (real Codex CLI uses Uuid::now_v7)", sid, v)
+	firstBytes, _ := io.ReadAll(first)
+	second, err := r.GetBody()
+	if err != nil {
+		t.Fatalf("GetBody (2nd): %v", err)
 	}
-	// Variant must be RFC4122 (high 2 bits of byte 8 = 10).
-	if u[8]&0xc0 != 0x80 {
-		t.Fatalf("derived session_id %q has non-RFC4122 variant bits 0x%02x", sid, u[8])
+	secondBytes, _ := io.ReadAll(second)
+	if !bytes.Equal(firstBytes, secondBytes) {
+		t.Fatalf("GetBody returned different bytes across calls: %q vs %q", firstBytes, secondBytes)
 	}
-	tsMs := extractV7TimestampMs(u)
-	now := time.Now().UnixMilli()
-	const window = int64(30 * 24 * time.Hour / time.Millisecond)
-	if tsMs > now+60_000 {
-		t.Fatalf("derived v7 timestamp %d is in the future (now=%d)", tsMs, now)
+	if int64(len(firstBytes)) != r.ContentLength {
+		t.Fatalf("ContentLength %d != actual body length %d", r.ContentLength, len(firstBytes))
 	}
-	if tsMs < now-window {
-		t.Fatalf("derived v7 timestamp %d is older than %d days (now=%d) — looks fake", tsMs, window/(24*60*60*1000), now)
+	// Sanity: derived values are present.
+	if pck := gjson.GetBytes(firstBytes, "prompt_cache_key").String(); pck == "" {
+		t.Fatal("prompt_cache_key not set on retry-safe body")
 	}
+	_ = time.Now // silence unused import if we trim other deps later
 }

@@ -25,30 +25,31 @@
 
 ### L1 不變式
 
+> **2026-05-11 重構**：所有 fingerprint hardening 集中到 `internal/runtime/executor/codex_fingerprint_hardening.go` 的 `applyCodexFingerprintHardeningHTTP` / `applyCodexFingerprintHardeningWS` 兩個函式。upstream 的 `cacheHelper` / `applyCodexHeaders` / `applyCodexPromptCacheHeaders` / `applyCodexWebsocketHeaders` 全部回到原版（**沒有 inline 修改**），只在每個 Execute 變體 / WS callsite 後面多一行 hardening 呼叫。下表的「驗證點」反映新結構。
+
 | 不變式 | 驗證點 |
 |---|---|
-| `cacheHelper` 接受 `auth *cliproxyauth.Auth` 參數 | `internal/runtime/executor/codex_executor.go` 的 `cacheHelper` 函式 signature |
-| `applyCodexPromptCacheHeaders` 接受 `ctx` 與 `auth` 參數 | `internal/runtime/executor/codex_websockets_executor.go` 的同名函式 signature |
-| 三個 HTTP / 兩個 websocket callsite 把 auth 傳進去 | grep `cacheHelper(ctx,` / `applyCodexPromptCacheHeaders(ctx,` |
-| **存在兩個獨立 derive 函式** `derivedSessionID` / `derivedThreadID`，namespace 不同 | `internal/runtime/executor/codex_session_id.go` 的 `derivedSessionNamespace` 跟 `derivedThreadNamespace` 兩個常數 + `derivedSessionID` / `derivedThreadID` 兩個函式 |
-| **對任何 (originalID, auth.ID)，`derivedSessionID(...) ≠ derivedThreadID(...)`** | `TestDerive_CrossStream_AlwaysDistinct_*`（兩個子測試各跑 50 次） |
-| cacheHelper 用 `derivedSessionID` 寫 `Session_id` header、用 `derivedThreadID` 寫 `Thread_id` / `X-Client-Request-Id` headers + body `prompt_cache_key` | grep `derivedSessionID\|derivedThreadID` 兩個 cacheHelper 函式內 |
-| codex 直連路徑分別讀 inbound `Session_id` 與 `Thread_id` 兩個 header（real Codex CLI 兩個都送） | cacheHelper 內 `sessionInput, threadInput := ...` 區段，HTTP 用 `ginCtx.GetHeader`、WS 用 `headerValueCaseInsensitive` |
-| `applyCodexHeaders` 對 `Session_id` / `Thread_id` / `X-Client-Request-Id` 的後處理都是「target 已有就不動」(不會被 `misc.EnsureHeader` 用 ginHeaders 覆蓋) | `codex_executor.go` 內 `if strings.TrimSpace(r.Header.Get(...)) == ""` 那幾段 |
-| `applyCodexWebsocketHeaders` 對 `session_id` / `thread_id` / `x-client-request-id` 也有對應保護 | `codex_websockets_executor.go` 內 `ensureHeaderCasePreserved(... "session_id" ...)` / `... "thread_id" ...` 跟 `if strings.TrimSpace(headerValueCaseInsensitive(headers, "x-client-request-id")) == ""` |
-| **`Conversation_id` header 必須不被送出**（real Codex CLI 不送） | grep 應該找不到 `headers.Set("Conversation_id"` 或 `setHeaderCasePreserved(... "Conversation_id"` |
-| **derive 輸出永遠是合法 UUIDv7，timestamp 落在最近合理範圍** | `codex_session_id.go` 內 version bits 強制 7、variant 強制 RFC4122、前 48 bit 是 timestamp（borrow inbound v7 / cache 的 `time.Now().UnixMilli()`）；regression test `assertCodexV7Mimic` 會在每個 scenario 對 Session_id + Thread_id + prompt_cache_key 自動驗證 |
-| **若 inbound 是合法 v7，輸出 v7 timestamp 必須等於 inbound 對應 stream 的 v7 timestamp** | `codex_session_id.go` 內 `if inU.Version()==7 { timestampMs = extractV7TimestampMs(inU) }`；`TestCodexExecutorCacheHelper_DirectCodex_MirrorsInboundV7Timestamp` 用兩個 inbound v7（各送 Session_id 與 Thread_id）自動驗證 |
-| **derive 輸出對 `(originalID, auth.ID)` 配對在進程 lifetime 內 deterministic** | `TestDerive_Deterministic_*` 跨 50 次呼叫驗證；timestamp cache TTL = 1h，cache 內重用 |
-| **`Thread_id == X-Client-Request-Id == prompt_cache_key`**（real Codex CLI 三個都用 state.thread_id） | regression test 對每個 record 都跑 `tid != xrid` / `tid != pck` 失敗 |
-| **`Session_id ≠ prompt_cache_key`**（real Codex CLI 永不會等於） | regression test 對每個 record 都跑 `sid == pck` 失敗 |
-| **每個 auth 在 metadata 內有 `installation_id`（合法 UUIDv4）** | grep `ensureCodexInstallationID` 在 `buildAuthRecord` (`sdk/auth/codex_device.go`) 與 `Refresh` (`codex_executor.go`) 都呼叫；`TestEnsureCodexInstallationID_*` 三條斷言（生成 v4、preserve 不覆寫、per-auth distinct） |
-| **`ensureCodexInstallationID` 永不覆寫已存在的值**（real client 也不會） | `TestEnsureCodexInstallationID_PreservesExistingValue` |
-| **body 永遠帶 `client_metadata.x-codex-installation-id`** 且為 v4 UUID | regression test 對每個 record assert `gjson.GetBytes(body, "client_metadata.x-codex-installation-id")` 非空、`uuid.Parse` OK、version == 4 |
-| **compact path 多送 `X-Codex-Installation-Id` header** | grep `strings.Contains(url, "/responses/compact")` 在 cacheHelper 內；對應分支設 `X-Codex-Installation-Id` |
-| **`X-Codex-Window-Id` 永遠帶**，格式 `"{uuid}:{integer}"` | regression test 對每個 record assert 存在、形狀對、thread 部分 = `Thread_id` header |
-| **`X-Codex-Window-Id` 的 thread 部分跨 auth 必不同** | `crossAuthLeakFields` 內 `X-Codex-Window-Id` 條目；regression test cross-auth check |
-| **codex 直連路徑保留 inbound `X-Codex-Window-Id` 的 generation 數字** | cacheHelper / applyCodexPromptCacheHeaders 內 `parseInboundWindowGeneration(...)` 讀 ginHeaders；`TestCodexWindowID_RoundTripGenerationFromInbound` 驗證 |
+| **存在 hardening 函式** `applyCodexFingerprintHardeningHTTP` / `applyCodexFingerprintHardeningWS` | grep `internal/runtime/executor/codex_fingerprint_hardening.go` 內兩個函式定義 |
+| **每條 outbound 路徑在 `applyCodex*Headers` 之後立即呼叫 hardening** | grep `applyCodexFingerprintHardeningHTTP(ctx, httpReq, auth, url)` 應出現 3 次（Execute, ExecuteStream, executeCompact）；`applyCodexFingerprintHardeningWS(ctx, body, wsHeaders, auth)` 應出現 2 次（websocket Execute / ExecuteStream） |
+| **`cacheHelper` / `applyCodexPromptCacheHeaders` 是 upstream 原版**（不含 auth 參數、不含我們的 inline derive） | `cacheHelper` signature 不含 `auth`；`applyCodexPromptCacheHeaders` 不含 `ctx` / `auth` |
+| **存在兩個獨立 derive 函式** `derivedSessionID` / `derivedThreadID`，namespace 不同 | `internal/runtime/executor/codex_session_id.go` 的 `derivedSessionNamespace` / `derivedThreadNamespace` 常數 + 兩個函式 |
+| **對任何 (originalID, auth.ID)，`derivedSessionID(...) ≠ derivedThreadID(...)`** | `TestDerive_CrossStream_AlwaysDistinct_*` |
+| **hardening 用 `derivedSessionID` 寫 `Session_id` header、用 `derivedThreadID` 寫 `Thread_id` / `X-Client-Request-Id` headers + body `prompt_cache_key`** | `applyCodexFingerprintHeaders` 函式內；`TestCodexFingerprintHardeningHTTP_*` / `TestCodexFingerprintHardeningWS_*` |
+| **codex 直連路徑分別讀 inbound `Session_id` 與 `Thread_id` 兩個 header** | `computeCodexFingerprintValues` 從 ginCtx 讀取；`TestCodexFingerprintHardeningHTTP_DirectCodex_MirrorsInboundV7Timestamp` 用 inbound v7 各送一個並驗證 derived 對齊 |
+| **WS hardening 必須 strip `Conversation_id` header**（upstream 原版會送，real client 不會） | `applyCodexFingerprintHardeningWS` 末尾 `headers.Del("Conversation_id")` 等四個 case 變體；`TestCodexFingerprintHardeningWS_NoConversationId_OnlySessionAndThread` |
+| **derive 輸出永遠是合法 UUIDv7，timestamp 落在最近合理範圍** | `assertCodexV7Mimic` / `assertLooksLikeRealCodexSessionID` 在 regression test 與單元測試對 Session_id + Thread_id + prompt_cache_key 各跑一次 |
+| **若 inbound 是合法 v7，輸出 v7 timestamp 必須等於 inbound 對應 stream 的 v7 timestamp** | `codex_session_id.go` 內 `if inU.Version()==7 { timestampMs = extractV7TimestampMs(inU) }`；`TestCodexFingerprintHardeningHTTP_DirectCodex_MirrorsInboundV7Timestamp` |
+| **derive 輸出對 `(originalID, auth.ID)` 配對在進程 lifetime 內 deterministic** | `TestDerive_Deterministic_*` 跨 50 次呼叫驗證；timestamp cache TTL = 1h |
+| **`Thread_id == X-Client-Request-Id == prompt_cache_key`**（real Codex CLI 三個都用 state.thread_id） | regression test 對每個 record 跑 `tid != xrid` / `tid != pck` 失敗 |
+| **`Session_id ≠ prompt_cache_key`**（real Codex CLI 永不會等於） | regression test 對每個 record 跑 `sid == pck` 失敗 |
+| **每個 auth 在 metadata 內有 `installation_id`（合法 UUIDv4）** | `ensureCodexInstallationID` 在 `buildAuthRecord` + `Refresh` 都呼叫；`TestEnsureCodexInstallationID_*` |
+| **`ensureCodexInstallationID` 永不覆寫已存在的值** | `TestEnsureCodexInstallationID_PreservesExistingValue` |
+| **body 永遠帶 `client_metadata.x-codex-installation-id`** 且為 v4 UUID | regression test |
+| **compact path 多送 `X-Codex-Installation-Id` header** | `applyCodexFingerprintHeaders(headers, v, compactPath, ...)` 內 `if compactPath && v.installationID != ""` 那段；`TestCodexFingerprintHardeningHTTP_CompactPath_AddsInstallationIDHeader` |
+| **`X-Codex-Window-Id` 永遠帶**，格式 `"{uuid}:{integer}"` | regression test |
+| **`X-Codex-Window-Id` 的 thread 部分跨 auth 必不同** | `crossAuthLeakFields` 內條目 |
+| **codex 直連路徑保留 inbound `X-Codex-Window-Id` 的 generation 數字** | `computeCodexFingerprintValues` 內 `parseInboundWindowGeneration(...)`；`TestCodexWindowID_RoundTripGenerationFromInbound` |
+| **httpReq.Body 重置後 GetBody 也重設**（讓 Go transport 可 retry） | `resetRequestBody` 設 `httpReq.GetBody`；`TestCodexFingerprintHardeningHTTP_BodyResetIsRetrySafe` |
 
 ### L4 不變式
 
@@ -180,15 +181,13 @@ git push origin "${UPSTREAM_TAG}-cpa"
 1. 開 `internal/runtime/executor/helps/usage_helpers.go` 看 `APIKeyFromContext` 用什麼 key
 2. 把我們的測試裡 `ginCtx.Set("舊key", ...)` 全部改成新 key（檢查 `internal/runtime/executor/codex_executor_cache_test.go`、`internal/runtime/executor/codex_fingerprint_regression_test.go`）
 
-### Mode C — `cacheHelper` / `applyCodexPromptCacheHeaders` signature 上游也改
+### Mode C — `cacheHelper` / `applyCodexPromptCacheHeaders` body 上游改
 
-**症狀**：upstream 也加 / 改參數，造成 signature 衝突。
+**症狀**：upstream 改這些函式的內部邏輯。
 
-**解法**：
-1. 先 accept upstream 對該函式的非 auth 相關修改
-2. 然後手動把 `auth *cliproxyauth.Auth` 加回參數列（一般加在最後）
-3. callsite 同步傳 auth
-4. 函式內保留 `derivePerAuthSessionID(cache.ID, auth)` 那一行
+**解法**：**通常不用做事**。2026-05-11 重構後我們不再 inline 修改這些函式——所有 fingerprint hardening 集中在 `applyCodexFingerprintHardeningHTTP` / `applyCodexFingerprintHardeningWS`，在 upstream 函式之後跑、會覆寫 upstream 的輸出。upstream 改 cacheHelper 內 `cache.ID` 算法、改 header 名字、改 body 欄位設定——hardening 會把它覆寫成我們要的值，下游看不出差異。
+
+例外：upstream 把 `cacheHelper` / `applyCodexPromptCacheHeaders` 的 signature 改了 → callsite 衝突。先 accept upstream 改動，3 個 cacheHelper callsite 與 2 個 applyCodexPromptCacheHeaders callsite 後面加回 hardening 呼叫即可（grep 範例見「L1 不變式」表）。
 
 ### Mode D — `Refresh()` 函式 upstream 重構
 

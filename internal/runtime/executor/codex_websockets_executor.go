@@ -220,8 +220,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(ctx, from, req, body, auth)
+	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	body, wsHeaders = applyCodexFingerprintHardeningWS(ctx, body, wsHeaders, auth)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -420,8 +421,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(ctx, from, req, body, auth)
+	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	body, wsHeaders = applyCodexFingerprintHardeningWS(ctx, body, wsHeaders, auth)
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID
@@ -803,7 +805,7 @@ func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 	return parsed.String(), nil
 }
 
-func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, auth *cliproxyauth.Auth) ([]byte, http.Header) {
+func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
 		return rawJSON, headers
@@ -830,75 +832,11 @@ func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format
 		}
 	}
 
-	// For codex direct WS path, real Codex CLI sends DISTINCT session_id and
-	// thread_id headers. Extract them separately so each derive stream can
-	// carry the inbound timestamp independently. For non-codex paths we share
-	// cache.ID across both streams (the namespace separation in derive*ID
-	// guarantees the outputs differ). See LEAK_RISKS.md L1, CODEX_CLI_REFERENCE.md.
-	sessionInput, threadInput := cache.ID, cache.ID
-	if cache.ID == "" {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			sessionInput = strings.TrimSpace(headerValueCaseInsensitive(ginCtx.Request.Header, "session_id"))
-			threadInput = strings.TrimSpace(headerValueCaseInsensitive(ginCtx.Request.Header, "thread_id"))
-		}
-		if threadInput == "" {
-			if pck := gjson.GetBytes(rawJSON, "prompt_cache_key"); pck.Exists() {
-				if pckStr := strings.TrimSpace(pck.String()); pckStr != "" {
-					threadInput = pckStr
-				}
-			}
-		}
-		if sessionInput == "" {
-			sessionInput = threadInput
-		}
-		if threadInput == "" {
-			threadInput = sessionInput
-		}
+	if cache.ID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+		setHeaderCasePreserved(headers, "session_id", cache.ID)
+		headers.Set("Conversation_id", cache.ID)
 	}
-
-	sessionDerived := derivedSessionID(sessionInput, auth)
-	threadDerived := derivedThreadID(threadInput, auth)
-
-	// LEAK_RISKS.md F + G + CODEX_CLI_REFERENCE.md §6.F/§6.G:
-	// - body's client_metadata.x-codex-installation-id always carries a stable
-	//   per-auth UUIDv4 (real Codex CLI sends one per install).
-	// - x-codex-window-id is "{thread_id}:{generation}". Codex direct path
-	//   preserves the inbound generation; non-codex defaults to 0.
-	installationID := codexInstallationIDForAuth(auth)
-	var windowGeneration uint64
-	if cache.ID == "" {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			windowGeneration = parseInboundWindowGeneration(headerValueCaseInsensitive(ginCtx.Request.Header, "x-codex-window-id"))
-		}
-	}
-	windowID := codexWindowID(threadDerived, windowGeneration)
-
-	if threadDerived != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", threadDerived)
-	}
-	if installationID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", installationID)
-		// Real Codex CLI's WS body's client_metadata is richer than HTTP's; it
-		// also carries x-codex-window-id (see codex-rs/core/src/client.rs:625-656).
-		if windowID != "" {
-			rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-window-id", windowID)
-		}
-	}
-	if sessionDerived != "" {
-		setHeaderCasePreserved(headers, "session_id", sessionDerived)
-	}
-	if threadDerived != "" {
-		setHeaderCasePreserved(headers, "thread_id", threadDerived)
-		setHeaderCasePreserved(headers, "x-client-request-id", threadDerived)
-	}
-	if windowID != "" {
-		setHeaderCasePreserved(headers, "x-codex-window-id", windowID)
-	}
-	// NOTE: previously this function also set a `Conversation_id` header to the
-	// same value. Real Codex CLI never sends that header (verified against
-	// codex-rs/core/src/client.rs:build_websocket_headers, see
-	// CODEX_CLI_REFERENCE.md §A). Sending it was itself a fingerprint, so it is
-	// no longer emitted.
 
 	return rawJSON, headers
 }
@@ -921,14 +859,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
-	// x-client-request-id: applyCodexPromptCacheHeaders writes the per-auth
-	// derived thread id here. Only fall back to ginHeaders if it didn't.
-	// (Mirrors session_id below — never let misc.EnsureHeader's source-first
-	// behaviour clobber a derived value with the raw inbound, which would
-	// re-leak the cross-auth correlation.)
-	if strings.TrimSpace(headerValueCaseInsensitive(headers, "x-client-request-id")) == "" {
-		misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
-	}
+	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
 	if isAPIKey {
@@ -947,10 +878,8 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	headers.Set("OpenAI-Beta", betaHeader)
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
 		ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", uuid.NewString())
-		ensureHeaderCasePreserved(headers, ginHeaders, "thread_id", "", uuid.NewString())
 	}
 	ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", "")
-	ensureHeaderCasePreserved(headers, ginHeaders, "thread_id", "", "")
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {

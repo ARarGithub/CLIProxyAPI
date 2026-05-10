@@ -344,16 +344,27 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 	}
 }
 
-func TestApplyCodexPromptCacheHeaders_NoConversationId_OnlySessionAndThread(t *testing.T) {
-	// applyCodexPromptCacheHeaders previously emitted a Conversation_id header.
-	// Real Codex CLI never sends that header (verified against codex-rs's
-	// build_websocket_headers), so emitting it was itself a fingerprint. This
-	// test pins the new contract: only session_id and thread_id (lowercase)
-	// must appear, never Conversation_id. See LEAK_RISKS.md L1, CODEX_CLI_REFERENCE.md §A.
-	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
-	auth := &cliproxyauth.Auth{ID: "auth-A"}
+// hardenWS is a tiny test helper that wires applyCodexPromptCacheHeaders +
+// applyCodexFingerprintHardeningWS the same way the executor does, so the
+// pre/post invariants below correspond to what real upstream sees.
+func hardenWS(t *testing.T, from sdktranslator.Format, payload []byte, body []byte, auth *cliproxyauth.Auth) ([]byte, http.Header) {
+	t.Helper()
+	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: payload}
+	body, headers := applyCodexPromptCacheHeaders(from, req, body)
+	body, headers = applyCodexFingerprintHardeningWS(context.Background(), body, headers, auth)
+	return body, headers
+}
 
-	_, headers := applyCodexPromptCacheHeaders(context.Background(), "openai-response", req, []byte(`{"model":"gpt-5-codex"}`), auth)
+func TestCodexFingerprintHardeningWS_NoConversationId_OnlySessionAndThread(t *testing.T) {
+	// Upstream's applyCodexPromptCacheHeaders sets a Conversation_id header;
+	// the hardening hook must strip it (real Codex CLI never sends it). Both
+	// session_id and thread_id (lowercase) must be present.
+	auth := &cliproxyauth.Auth{ID: "auth-A"}
+	ensureCodexInstallationID(auth)
+
+	_, headers := hardenWS(t, "openai-response",
+		[]byte(`{"prompt_cache_key":"cache-1"}`),
+		[]byte(`{"model":"gpt-5-codex"}`), auth)
 
 	if sid := headerValueCaseInsensitive(headers, "session_id"); sid == "" {
 		t.Fatalf("session_id header should be set, got empty (headers=%#v)", headers)
@@ -368,22 +379,27 @@ func TestApplyCodexPromptCacheHeaders_NoConversationId_OnlySessionAndThread(t *t
 		t.Fatalf("expected lowercase thread_id key, got %#v", headers)
 	}
 	if got := headers.Get("Conversation_id"); got != "" {
-		t.Fatalf("Conversation_id must NOT be emitted (real Codex CLI doesn't send it); got %q", got)
+		t.Fatalf("Conversation_id must NOT be present (real Codex CLI doesn't send it); got %q", got)
 	}
 	for k := range headers {
 		if strings.EqualFold(k, "conversation_id") || strings.EqualFold(k, "conversation-id") {
-			t.Fatalf("found conversation-id-like header %q in output; must be absent", k)
+			t.Fatalf("found conversation-id-like header %q in output; must be stripped", k)
 		}
 	}
 }
 
-func TestApplyCodexPromptCacheHeaders_DerivesSessionAndThreadPerAuth(t *testing.T) {
-	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
+func TestCodexFingerprintHardeningWS_DerivesSessionAndThreadPerAuth(t *testing.T) {
 	authA := &cliproxyauth.Auth{ID: "auth-A"}
 	authB := &cliproxyauth.Auth{ID: "auth-B"}
+	ensureCodexInstallationID(authA)
+	ensureCodexInstallationID(authB)
 
-	bodyA, hA := applyCodexPromptCacheHeaders(context.Background(), "openai-response", req, []byte(`{"model":"gpt-5-codex"}`), authA)
-	bodyB, hB := applyCodexPromptCacheHeaders(context.Background(), "openai-response", req, []byte(`{"model":"gpt-5-codex"}`), authB)
+	bodyA, hA := hardenWS(t, "openai-response",
+		[]byte(`{"prompt_cache_key":"cache-1"}`),
+		[]byte(`{"model":"gpt-5-codex"}`), authA)
+	bodyB, hB := hardenWS(t, "openai-response",
+		[]byte(`{"prompt_cache_key":"cache-1"}`),
+		[]byte(`{"model":"gpt-5-codex"}`), authB)
 
 	sidA := headerValueCaseInsensitive(hA, "session_id")
 	sidB := headerValueCaseInsensitive(hB, "session_id")
@@ -391,37 +407,37 @@ func TestApplyCodexPromptCacheHeaders_DerivesSessionAndThreadPerAuth(t *testing.
 	tidB := headerValueCaseInsensitive(hB, "thread_id")
 	xrA := headerValueCaseInsensitive(hA, "x-client-request-id")
 	xrB := headerValueCaseInsensitive(hB, "x-client-request-id")
+	widA := headerValueCaseInsensitive(hA, "x-codex-window-id")
+	widB := headerValueCaseInsensitive(hB, "x-codex-window-id")
 	pckA := gjson.GetBytes(bodyA, "prompt_cache_key").String()
 	pckB := gjson.GetBytes(bodyB, "prompt_cache_key").String()
+	instA := gjson.GetBytes(bodyA, "client_metadata.x-codex-installation-id").String()
+	instB := gjson.GetBytes(bodyB, "client_metadata.x-codex-installation-id").String()
+	wsWidA := gjson.GetBytes(bodyA, "client_metadata.x-codex-window-id").String()
 
-	for _, v := range []string{sidA, sidB, tidA, tidB, xrA, xrB, pckA, pckB} {
+	for _, v := range []string{sidA, sidB, tidA, tidB, xrA, xrB, widA, widB, pckA, pckB, instA, instB, wsWidA} {
 		if v == "" {
-			t.Fatalf("missing required value (sidA=%q sidB=%q tidA=%q tidB=%q xrA=%q xrB=%q pckA=%q pckB=%q)",
-				sidA, sidB, tidA, tidB, xrA, xrB, pckA, pckB)
+			t.Fatalf("missing required value")
 		}
 	}
 	if sidA == "cache-1" || sidB == "cache-1" || tidA == "cache-1" || tidB == "cache-1" {
 		t.Fatalf("raw client cache key forwarded without derivation")
 	}
-	// Cross-auth: every value must differ.
-	if sidA == sidB || tidA == tidB || xrA == xrB || pckA == pckB {
-		t.Fatalf("cross-auth leak: sidA=sidB? tidA=tidB? xrA=xrB? pckA=pckB?")
+	if sidA == sidB || tidA == tidB || xrA == xrB || pckA == pckB || widA == widB || instA == instB {
+		t.Fatalf("cross-auth leak across one of the per-auth derived values")
 	}
-	// Within auth: thread_id == x-client-request-id == prompt_cache_key (real
-	// Codex CLI uses thread_id for all three).
 	if tidA != xrA || tidA != pckA {
 		t.Fatalf("auth-A: thread_id (%q), x-client-request-id (%q), prompt_cache_key (%q) must be equal", tidA, xrA, pckA)
 	}
 	if tidB != xrB || tidB != pckB {
 		t.Fatalf("auth-B: thread_id (%q), x-client-request-id (%q), prompt_cache_key (%q) must be equal", tidB, xrB, pckB)
 	}
-	// session_id and thread_id must NEVER be equal (real Codex CLI never emits
-	// them equal — they're independent v7 UUIDs).
-	if sidA == tidA {
-		t.Fatalf("auth-A: session_id == thread_id (%q) — would leak Session_id == prompt_cache_key", sidA)
+	if sidA == tidA || sidB == tidB {
+		t.Fatalf("session_id == thread_id within an auth — real Codex CLI never makes them equal")
 	}
-	if sidB == tidB {
-		t.Fatalf("auth-B: session_id == thread_id (%q) — would leak Session_id == prompt_cache_key", sidB)
+	// WS body's client_metadata also carries window_id (mirror real client).
+	if wsWidA != widA {
+		t.Fatalf("WS body client_metadata.x-codex-window-id (%q) must equal header X-Codex-Window-Id (%q)", wsWidA, widA)
 	}
 }
 
