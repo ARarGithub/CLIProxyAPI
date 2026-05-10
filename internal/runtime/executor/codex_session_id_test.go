@@ -10,129 +10,122 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-// This file is the focused unit-test suite for derivePerAuthSessionID. Tests
-// are grouped by guarantee:
+// Focused unit-test suite for the two derive streams (derivedSessionID +
+// derivedThreadID). Tests are grouped by guarantee:
 //
-//   §1 Determinism
-//   §2 Auth-switching round-trip (returning to a previous auth gives back the
-//      same upstream id)
-//   §3 Timestamp correctness (mirrored from inbound v7 / pinned for non-v7)
-//   §4 Cross-input distinctness
-//   §5 Edge cases (nil/empty, whitespace, non-v7 inbound)
-//   §6 Structural validity (every output is a valid v7-looking UUID)
-//   §7 Concurrency safety
-//
-// Real Codex CLI uses Uuid::now_v7() (codex-rs/protocol/src/session_id.rs).
-// All outputs of derivePerAuthSessionID must be indistinguishable from a real
-// Codex CLI session id by trivial structural inspection from the upstream.
+//   §1 Determinism — same inputs always return the same output.
+//   §2 Auth-switching round-trip — returning to a previous auth restores the
+//      previous derived value (so per-account upstream prompt cache hits).
+//   §3 Timestamp correctness — borrowed from inbound v7 / pinned via cache.
+//   §4 Cross-input distinctness.
+//   §5 Cross-stream distinctness — derivedSessionID ≠ derivedThreadID even
+//      with identical (originalID, auth.ID), so that prompt_cache_key (= thread
+//      stream) never equals Session_id (= session stream) — which would itself
+//      be a fingerprint, since real Codex CLI never makes them equal.
+//   §6 Edge cases (nil/empty, whitespace, non-v7 inbound).
+//   §7 Structural validity — every output is a valid v7-looking UUID.
+//   §8 Concurrency safety.
 //
 // See LEAK_RISKS.md L1, SESSION_ID_BEHAVIOR.md, MERGE_GUIDE.md "Session ID
-// test suite" section.
+// test suite", CODEX_CLI_REFERENCE.md.
 
-// makeAuth is a tiny helper to construct a minimal auth with just an ID, which
-// is all derivePerAuthSessionID consumes.
 func makeAuth(id string) *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{ID: id}
 }
 
-// freshNonCodexInput returns an originalID guaranteed to NOT parse as a v7
-// UUID (it intentionally is not even a UUID), so derivePerAuthSessionID falls
-// onto its non-codex-direct timestamp path. Includes the test name in the
-// string to keep cache keys disjoint across tests so one test's cache state
-// can't leak into another's.
 func freshNonCodexInput(t *testing.T) string {
 	t.Helper()
 	return fmt.Sprintf("non-uuid-input::%s::%d", t.Name(), time.Now().UnixNano())
 }
 
-// freshCodexV7Input returns a fresh real UUIDv7 string, simulating what the
-// Codex CLI would send in its Session_id header.
 func freshCodexV7Input(t *testing.T) string {
 	t.Helper()
 	return uuid.Must(uuid.NewV7()).String()
 }
 
+// derives is a small helper that returns both streams in one call so that
+// tests asserting joint properties (e.g. cross-stream distinctness) read more
+// naturally.
+func derives(originalID string, auth *cliproxyauth.Auth) (sessionDerived, threadDerived string) {
+	return derivedSessionID(originalID, auth), derivedThreadID(originalID, auth)
+}
+
 // ---------------------------------------------------------------------------
-// §1 Determinism: same (originalID, auth.ID) input → same output, always.
+// §1 Determinism
 // ---------------------------------------------------------------------------
 
-func TestDerivePerAuthSessionID_Deterministic_CodexDirect(t *testing.T) {
+func TestDerive_Deterministic_CodexDirect(t *testing.T) {
 	in := freshCodexV7Input(t)
 	a := makeAuth("auth-A")
 
-	first := derivePerAuthSessionID(in, a)
+	sFirst, tFirst := derives(in, a)
 	for i := 0; i < 50; i++ {
-		got := derivePerAuthSessionID(in, a)
-		if got != first {
-			t.Fatalf("call %d: got %q, want %q (codex direct must be deterministic)", i, got, first)
+		s, th := derives(in, a)
+		if s != sFirst || th != tFirst {
+			t.Fatalf("call %d: derived values changed across calls (session %q→%q, thread %q→%q)",
+				i, sFirst, s, tFirst, th)
 		}
 	}
 }
 
-func TestDerivePerAuthSessionID_Deterministic_NonCodex(t *testing.T) {
+func TestDerive_Deterministic_NonCodex(t *testing.T) {
 	in := freshNonCodexInput(t)
 	a := makeAuth("auth-A")
 
-	first := derivePerAuthSessionID(in, a)
+	sFirst, tFirst := derives(in, a)
 	for i := 0; i < 50; i++ {
-		got := derivePerAuthSessionID(in, a)
-		if got != first {
-			t.Fatalf("call %d: got %q, want %q (non-codex must be deterministic within process via cache)", i, got, first)
+		s, th := derives(in, a)
+		if s != sFirst || th != tFirst {
+			t.Fatalf("call %d: derived values changed across calls (session %q→%q, thread %q→%q)",
+				i, sFirst, s, tFirst, th)
 		}
 	}
 }
 
 // ---------------------------------------------------------------------------
-// §2 Auth-switching round-trip:
-//      (X, A) -> s0
-//      (X, B) -> s1
-//      (X, A) -> s2
-//      (X, B) -> s3
-//    Must hold: s0 == s2, s1 == s3, s0 != s1.
-//    This proves that switching back to a previous auth restores the previous
-//    upstream session id (so prompt cache continuity works) AND that within
-//    one auth period the value is stable.
+// §2 Auth-switching round-trip — must hold for BOTH streams independently.
 // ---------------------------------------------------------------------------
 
-func TestDerivePerAuthSessionID_AuthSwitching_RoundTrip_CodexDirect(t *testing.T) {
+func TestDerive_AuthSwitching_RoundTrip_CodexDirect(t *testing.T) {
 	in := freshCodexV7Input(t)
 	a := makeAuth("auth-A")
 	b := makeAuth("auth-B")
 
-	s0 := derivePerAuthSessionID(in, a)
-	s1 := derivePerAuthSessionID(in, b)
-	s2 := derivePerAuthSessionID(in, a)
-	s3 := derivePerAuthSessionID(in, b)
+	sA0, tA0 := derives(in, a)
+	sB0, tB0 := derives(in, b)
+	sA1, tA1 := derives(in, a)
+	sB1, tB1 := derives(in, b)
 
-	if s0 != s2 {
-		t.Fatalf("returning to auth A must give same id: s0=%q s2=%q", s0, s2)
+	if sA0 != sA1 || tA0 != tA1 {
+		t.Fatalf("auth A round-trip not stable: session %q→%q, thread %q→%q", sA0, sA1, tA0, tA1)
 	}
-	if s1 != s3 {
-		t.Fatalf("returning to auth B must give same id: s1=%q s3=%q", s1, s3)
+	if sB0 != sB1 || tB0 != tB1 {
+		t.Fatalf("auth B round-trip not stable: session %q→%q, thread %q→%q", sB0, sB1, tB0, tB1)
 	}
-	if s0 == s1 {
-		t.Fatalf("cross-auth must differ at all times: s0=s1=%q", s0)
+	if sA0 == sB0 {
+		t.Fatalf("session stream leaked across auths: A=B=%q", sA0)
+	}
+	if tA0 == tB0 {
+		t.Fatalf("thread stream leaked across auths: A=B=%q", tA0)
 	}
 }
 
-func TestDerivePerAuthSessionID_AuthSwitching_RoundTrip_NonCodex(t *testing.T) {
+func TestDerive_AuthSwitching_RoundTrip_NonCodex(t *testing.T) {
 	in := freshNonCodexInput(t)
 	a := makeAuth("auth-A")
 	b := makeAuth("auth-B")
 
-	s0 := derivePerAuthSessionID(in, a)
-	s1 := derivePerAuthSessionID(in, b)
-	s2 := derivePerAuthSessionID(in, a)
-	s3 := derivePerAuthSessionID(in, b)
+	sA0, tA0 := derives(in, a)
+	sB0, tB0 := derives(in, b)
+	sA1, tA1 := derives(in, a)
+	sB1, tB1 := derives(in, b)
 
-	if s0 != s2 {
-		t.Fatalf("returning to auth A must give same id: s0=%q s2=%q", s0, s2)
+	if sA0 != sA1 || tA0 != tA1 || sB0 != sB1 || tB0 != tB1 {
+		t.Fatalf("round-trip not stable across auth-A/B: %q %q %q %q %q %q %q %q",
+			sA0, sA1, tA0, tA1, sB0, sB1, tB0, tB1)
 	}
-	if s1 != s3 {
-		t.Fatalf("returning to auth B must give same id: s1=%q s3=%q", s1, s3)
-	}
-	if s0 == s1 {
-		t.Fatalf("cross-auth must differ at all times: s0=s1=%q", s0)
+	if sA0 == sB0 || tA0 == tB0 {
+		t.Fatalf("cross-auth leak: session A=B=%q? thread A=B=%q?", sA0, tA0)
 	}
 }
 
@@ -140,61 +133,44 @@ func TestDerivePerAuthSessionID_AuthSwitching_RoundTrip_NonCodex(t *testing.T) {
 // §3 Timestamp correctness
 // ---------------------------------------------------------------------------
 
-func TestDerivePerAuthSessionID_Timestamp_BorrowedFromInboundV7(t *testing.T) {
+func TestDerive_Timestamp_BorrowedFromInboundV7(t *testing.T) {
 	inStr := freshCodexV7Input(t)
-	inU := uuid.MustParse(inStr)
-	wantTS := extractV7TimestampMs(inU)
+	wantTS := extractV7TimestampMs(uuid.MustParse(inStr))
 
 	for _, authID := range []string{"auth-A", "auth-B", "auth-some-long-id-xyz"} {
-		got := derivePerAuthSessionID(inStr, makeAuth(authID))
-		gotTS := extractV7TimestampMs(uuid.MustParse(got))
-		if gotTS != wantTS {
-			t.Errorf("auth %q: derived timestamp %d, want inbound %d", authID, gotTS, wantTS)
+		auth := makeAuth(authID)
+		s, th := derives(inStr, auth)
+		for _, sid := range []string{s, th} {
+			gotTS := extractV7TimestampMs(uuid.MustParse(sid))
+			if gotTS != wantTS {
+				t.Errorf("auth %q: derived %q timestamp %d, want inbound %d", authID, sid, gotTS, wantTS)
+			}
 		}
 	}
 }
 
-func TestDerivePerAuthSessionID_Timestamp_PinnedAtFirstCall_NonCodex(t *testing.T) {
+func TestDerive_Timestamp_PinnedAtFirstCall_NonCodex(t *testing.T) {
 	in := freshNonCodexInput(t)
 	a := makeAuth("auth-A")
 
 	before := time.Now().UnixMilli()
-	first := derivePerAuthSessionID(in, a)
+	s1, t1 := derives(in, a)
 	after := time.Now().UnixMilli()
 
-	tsFirst := extractV7TimestampMs(uuid.MustParse(first))
-	if tsFirst < before-100 || tsFirst > after+100 {
-		t.Fatalf("first-call timestamp %d should be within [%d, %d]", tsFirst, before, after)
+	for _, sid := range []string{s1, t1} {
+		ts := extractV7TimestampMs(uuid.MustParse(sid))
+		if ts < before-100 || ts > after+100 {
+			t.Fatalf("first-call timestamp %d should be in [%d, %d] (sid=%s)", ts, before, after, sid)
+		}
 	}
 
-	// Sleep just enough for time.Now() to advance, then call again. The
-	// cached timestamp should be reused, so the new derive output must have
-	// the SAME timestamp (not advance with the clock).
 	time.Sleep(20 * time.Millisecond)
-	second := derivePerAuthSessionID(in, a)
-	tsSecond := extractV7TimestampMs(uuid.MustParse(second))
-	if tsSecond != tsFirst {
-		t.Fatalf("subsequent call must reuse cached timestamp: first=%d second=%d (clock advanced unexpectedly)", tsFirst, tsSecond)
+	s2, t2 := derives(in, a)
+	if s1 != s2 {
+		t.Fatalf("session stream timestamp changed across calls (cache should pin): %q vs %q", s1, s2)
 	}
-}
-
-func TestDerivePerAuthSessionID_Timestamp_DifferentAuthsHaveIndependentCacheEntries(t *testing.T) {
-	in := freshNonCodexInput(t)
-
-	tsA1 := extractV7TimestampMs(uuid.MustParse(derivePerAuthSessionID(in, makeAuth("auth-A"))))
-	time.Sleep(20 * time.Millisecond)
-	tsB1 := extractV7TimestampMs(uuid.MustParse(derivePerAuthSessionID(in, makeAuth("auth-B"))))
-	tsA2 := extractV7TimestampMs(uuid.MustParse(derivePerAuthSessionID(in, makeAuth("auth-A"))))
-	tsB2 := extractV7TimestampMs(uuid.MustParse(derivePerAuthSessionID(in, makeAuth("auth-B"))))
-
-	if tsA1 != tsA2 {
-		t.Errorf("auth-A timestamp not pinned across calls: %d vs %d", tsA1, tsA2)
-	}
-	if tsB1 != tsB2 {
-		t.Errorf("auth-B timestamp not pinned across calls: %d vs %d", tsB1, tsB2)
-	}
-	if tsA1 == tsB1 {
-		t.Errorf("auth-A and auth-B share the same cache slot: both %d (independent cache entries expected)", tsA1)
+	if t1 != t2 {
+		t.Fatalf("thread stream timestamp changed across calls (cache should pin): %q vs %q", t1, t2)
 	}
 }
 
@@ -202,81 +178,116 @@ func TestDerivePerAuthSessionID_Timestamp_DifferentAuthsHaveIndependentCacheEntr
 // §4 Cross-input distinctness
 // ---------------------------------------------------------------------------
 
-func TestDerivePerAuthSessionID_DifferentInputs_DifferentOutputs(t *testing.T) {
+func TestDerive_DifferentInputs_DifferentOutputs(t *testing.T) {
 	a := makeAuth("auth-A")
-
 	x := freshCodexV7Input(t)
 	y := freshCodexV7Input(t)
 	if x == y {
-		t.Fatalf("setup error: expected two different v7 inputs, got %q twice", x)
+		t.Fatalf("setup: expected two different v7 inputs")
 	}
 
-	sx := derivePerAuthSessionID(x, a)
-	sy := derivePerAuthSessionID(y, a)
-	if sx == sy {
-		t.Fatalf("different inputs must produce different outputs: %q == %q", sx, sy)
+	sX, tX := derives(x, a)
+	sY, tY := derives(y, a)
+	if sX == sY {
+		t.Fatalf("session stream collapsed inputs: %q == %q", sX, sY)
 	}
-}
-
-func TestDerivePerAuthSessionID_DifferentAuths_DifferentOutputs(t *testing.T) {
-	in := freshCodexV7Input(t)
-
-	sA := derivePerAuthSessionID(in, makeAuth("auth-A"))
-	sB := derivePerAuthSessionID(in, makeAuth("auth-B"))
-	if sA == sB {
-		t.Fatalf("different auths must produce different outputs: A=B=%q", sA)
+	if tX == tY {
+		t.Fatalf("thread stream collapsed inputs: %q == %q", tX, tY)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// §5 Edge cases — function must be safe to call with degenerate inputs.
+// §5 Cross-stream distinctness — THE central guarantee of the two-stream
+//    redesign. Real Codex CLI sends session_id ≠ thread_id (= prompt_cache_key)
+//    and our derive must mirror that, so that body.prompt_cache_key !=
+//    header.Session_id at every layer.
 // ---------------------------------------------------------------------------
 
-func TestDerivePerAuthSessionID_EmptyOriginalID_ReturnsEmpty(t *testing.T) {
-	if got := derivePerAuthSessionID("", makeAuth("auth-A")); got != "" {
-		t.Fatalf("empty originalID should yield empty output, got %q", got)
-	}
-	if got := derivePerAuthSessionID("   ", makeAuth("auth-A")); got != "" {
-		t.Fatalf("whitespace-only originalID should yield empty output, got %q", got)
+func TestDerive_CrossStream_AlwaysDistinct_CodexDirect(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		in := freshCodexV7Input(t)
+		auth := makeAuth(fmt.Sprintf("auth-%d", i))
+		s, th := derives(in, auth)
+		if s == th {
+			t.Fatalf("trial %d: session derived == thread derived for input %q auth %q (both %q) — would leak Session_id == prompt_cache_key",
+				i, in, auth.ID, s)
+		}
 	}
 }
 
-func TestDerivePerAuthSessionID_NilAuth_ReturnsOriginal(t *testing.T) {
+func TestDerive_CrossStream_AlwaysDistinct_NonCodex(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		in := fmt.Sprintf("non-uuid-input-%d-%d", i, time.Now().UnixNano())
+		auth := makeAuth(fmt.Sprintf("auth-%d", i))
+		s, th := derives(in, auth)
+		if s == th {
+			t.Fatalf("trial %d: session derived == thread derived for input %q auth %q (both %q)",
+				i, in, auth.ID, s)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §6 Edge cases
+// ---------------------------------------------------------------------------
+
+func TestDerive_EmptyOriginalID_ReturnsEmpty(t *testing.T) {
+	for _, fn := range []struct {
+		name string
+		f    func(string, *cliproxyauth.Auth) string
+	}{
+		{"derivedSessionID", derivedSessionID},
+		{"derivedThreadID", derivedThreadID},
+	} {
+		if got := fn.f("", makeAuth("auth-A")); got != "" {
+			t.Errorf("%s(\"\", ...) = %q, want \"\"", fn.name, got)
+		}
+		if got := fn.f("   ", makeAuth("auth-A")); got != "" {
+			t.Errorf("%s(\"   \", ...) = %q, want \"\"", fn.name, got)
+		}
+	}
+}
+
+func TestDerive_NilAuth_ReturnsOriginal(t *testing.T) {
 	in := freshCodexV7Input(t)
-	if got := derivePerAuthSessionID(in, nil); got != in {
-		t.Fatalf("nil auth must pass-through originalID, got %q want %q", got, in)
+	if got := derivedSessionID(in, nil); got != in {
+		t.Errorf("derivedSessionID(in, nil) = %q, want %q", got, in)
+	}
+	if got := derivedThreadID(in, nil); got != in {
+		t.Errorf("derivedThreadID(in, nil) = %q, want %q", got, in)
 	}
 }
 
-func TestDerivePerAuthSessionID_EmptyAuthID_ReturnsOriginal(t *testing.T) {
+func TestDerive_EmptyAuthID_ReturnsOriginal(t *testing.T) {
 	in := freshCodexV7Input(t)
-	if got := derivePerAuthSessionID(in, makeAuth("")); got != in {
-		t.Fatalf("empty auth.ID must pass-through originalID, got %q want %q", got, in)
-	}
-	if got := derivePerAuthSessionID(in, makeAuth("   ")); got != in {
-		t.Fatalf("whitespace-only auth.ID must pass-through originalID, got %q want %q", got, in)
+	for _, authID := range []string{"", "   "} {
+		auth := makeAuth(authID)
+		if got := derivedSessionID(in, auth); got != in {
+			t.Errorf("derivedSessionID(in, auth.ID=%q) = %q, want %q", authID, got, in)
+		}
+		if got := derivedThreadID(in, auth); got != in {
+			t.Errorf("derivedThreadID(in, auth.ID=%q) = %q, want %q", authID, got, in)
+		}
 	}
 }
 
-func TestDerivePerAuthSessionID_NonV7Inbound_OutputsV7(t *testing.T) {
-	// uuid.NewSHA1 produces v5; uuid.New produces v4. The proxy must NOT
-	// mirror these versions to upstream — real Codex CLI only ever emits v7.
+func TestDerive_NonV7Inbound_OutputsV7(t *testing.T) {
 	v4 := uuid.New().String()
 	v5 := uuid.NewSHA1(uuid.NameSpaceOID, []byte("test")).String()
 
-	for _, in := range []string{v4, v5, "not-a-uuid-at-all", freshNonCodexInput(t)} {
-		got := derivePerAuthSessionID(in, makeAuth("auth-A"))
-		assertLooksLikeRealCodexSessionID(t, got)
+	for _, in := range []string{v4, v5, "not-a-uuid", freshNonCodexInput(t)} {
+		auth := makeAuth("auth-A")
+		s, th := derives(in, auth)
+		assertLooksLikeRealCodexSessionID(t, s)
+		assertLooksLikeRealCodexSessionID(t, th)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// §6 Structural validity — every output is a valid v7-looking UUID.
-//    (The detail check is in assertLooksLikeRealCodexSessionID, defined in
-//    codex_executor_cache_test.go in the same package.)
+// §7 Structural validity
 // ---------------------------------------------------------------------------
 
-func TestDerivePerAuthSessionID_StructurallyValidV7(t *testing.T) {
+func TestDerive_StructurallyValidV7(t *testing.T) {
 	cases := []struct {
 		name string
 		in   string
@@ -289,40 +300,46 @@ func TestDerivePerAuthSessionID_StructurallyValidV7(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := derivePerAuthSessionID(tc.in, makeAuth("auth-A"))
-			assertLooksLikeRealCodexSessionID(t, got)
+			auth := makeAuth("auth-A")
+			s, th := derives(tc.in, auth)
+			assertLooksLikeRealCodexSessionID(t, s)
+			assertLooksLikeRealCodexSessionID(t, th)
 		})
 	}
 }
 
 // ---------------------------------------------------------------------------
-// §7 Concurrency safety — many goroutines hitting the same input must all
-//    agree on the output (cache mutex correctness).
+// §8 Concurrency safety — both streams' caches must be mutex-correct.
 // ---------------------------------------------------------------------------
 
-func TestDerivePerAuthSessionID_ConcurrentSameInput_AllAgree(t *testing.T) {
+func TestDerive_ConcurrentSameInput_AllAgree(t *testing.T) {
 	in := freshNonCodexInput(t)
 	a := makeAuth("auth-A")
 
 	const goroutines = 64
 	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		results = make(map[string]int, goroutines)
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		sessions = make(map[string]int)
+		threads  = make(map[string]int)
 	)
 	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			got := derivePerAuthSessionID(in, a)
+			s, th := derives(in, a)
 			mu.Lock()
-			results[got]++
+			sessions[s]++
+			threads[th]++
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
-	if len(results) != 1 {
-		t.Fatalf("concurrent calls disagreed: %d distinct outputs %v", len(results), results)
+	if len(sessions) != 1 {
+		t.Fatalf("session stream: concurrent calls disagreed: %v", sessions)
+	}
+	if len(threads) != 1 {
+		t.Fatalf("thread stream: concurrent calls disagreed: %v", threads)
 	}
 }

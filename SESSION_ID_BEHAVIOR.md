@@ -6,28 +6,49 @@
 
 ---
 
-## L1 patch 的核心 derive 機制
+## L1 patch 的核心 derive 機制（雙 stream）
+
+L1 patch 提供**兩個獨立** derive 函式，因為 real Codex CLI 在每個請求送出 **兩個獨立的 v7 UUID**：`session_id`（headers）跟 `thread_id`（headers + body 的 `prompt_cache_key`）。把兩者當成同一個值會被上游一秒抓到，因此分開 derive。
 
 ```go
 // internal/runtime/executor/codex_session_id.go
-func derivePerAuthSessionID(originalID string, auth *cliproxyauth.Auth) string {
-    // ... nil / empty 防呆 ...
-    // 1. 永遠輸出 UUIDv7（real Codex CLI 用 Uuid::now_v7）
-    // 2. timestamp（前 48 bit）：
-    //    - 如果 inbound 是合法 v7 → 借用 inbound 的 timestamp
-    //    - 否則 → 用 in-memory cache pin first-call 的 time.Now() (TTL 1h)
-    // 3. rand_a + rand_b（剩下 80 bit）：SHA1(originalID + ":" + auth.ID)
-    // 4. version bits 強制設成 7、variant bits 強制設成 RFC4122 (10)
-}
+
+// 給 upstream 的 Session_id / session_id headers
+func derivedSessionID(originalID string, auth *cliproxyauth.Auth) string
+
+// 給 Thread_id / thread_id / X-Client-Request-Id headers AND body's
+// prompt_cache_key (real Codex CLI 用 thread_id 字串當 prompt_cache_key)
+func derivedThreadID(originalID string, auth *cliproxyauth.Auth) string
 ```
 
-**呼叫點**：
-- HTTP path：`internal/runtime/executor/codex_executor.go`（cacheHelper 內）
-- WebSocket path：`internal/runtime/executor/codex_websockets_executor.go`（applyCodexPromptCacheHeaders 內）
+兩個函式內部走同一個 `deriveV7Mimic(namespace, originalID, auth)`，但傳的 namespace 不同：
 
-兩個都在「決定要打哪個 auth 之後、寫到 outbound header / body 之前」。
+- `derivedSessionNamespace = "cli-proxy-api:codex:per-auth:session_id:v7"`
+- `derivedThreadNamespace  = "cli-proxy-api:codex:per-auth:thread_id:v7"`
 
-實際送上游的 `Session_id` 永遠是 `derive(originalID, currentAuth)` 的結果，不是 `originalID` 本身。
+namespace 不同 → SHA1 hash 不同 → **對任何 (originalID, auth.ID)，輸出永遠不同**。
+這個性質就是「Session_id ≠ prompt_cache_key」的數學保證。
+
+### 兩個 stream 的共同性質
+
+每個 derive 都產生：
+1. 永遠輸出 UUIDv7（real Codex CLI 用 `Uuid::now_v7()`）
+2. timestamp（前 48 bit）：
+   - 如果 inbound 是合法 v7 → 借用 inbound 的 timestamp
+   - 否則 → 用 in-memory cache pin first-call 的 `time.Now()` (TTL 1h)
+3. rand_a + rand_b（剩下 80 bit）：`SHA1(namespace + ":" + originalID + ":" + auth.ID)`
+4. version bits 強制設成 7、variant bits 強制設成 RFC4122 (10)
+
+### 呼叫點 + 三筆對齊的輸出
+
+| 路徑 | 函式 | 寫入位置 |
+|---|---|---|
+| HTTP | `cacheHelper`（`codex_executor.go`） | `Session_id` header = `derivedSessionID(...)`<br>`Thread_id` header = `X-Client-Request-Id` header = body `prompt_cache_key` = `derivedThreadID(...)` |
+| WS | `applyCodexPromptCacheHeaders`（`codex_websockets_executor.go`） | `session_id` header (lowercase) = `derivedSessionID(...)`<br>`thread_id` header = `x-client-request-id` header = body `prompt_cache_key` = `derivedThreadID(...)` |
+
+兩個 path 都在「決定要打哪個 auth 之後、寫到 outbound header / body 之前」呼叫 derive。
+
+WS path **不送** `Conversation_id` header（real Codex CLI 從不送這個 header；上游 fork 自己加的，已移除）。
 
 ### 為什麼是 v7 不是更簡單的 UUIDv5
 
@@ -40,8 +61,8 @@ UUIDv7（real Codex CLI 用的）= 48-bit unix-ms timestamp + version=7 + 12-bit
 
 | 路徑 | timestamp 來源 | 跨重啟 derive 結果 |
 |---|---|---|
-| **Codex CLI 直連** | client 送的 v7，借用其 timestamp | **deterministic**（只要 client 還用同 session）；上游視角是「同一 session 跨網路中斷繼續」 |
-| **非 codex 路徑** | in-memory cache pin first-call 的 `time.Now().UnixMilli()`，TTL 1 小時 | **重啟後變動**；上游視角等同「同一個 client 開了新 session」（合理行為，跟真人 client 重啟同樣表現） |
+| **Codex CLI 直連** | client 送的 v7（兩個 stream 各自借用 inbound 的 `Session_id` 跟 `Thread_id` v7 timestamp） | **deterministic**（client 沒換 session 就不變）；上游視角是「同一 session 跨網路中斷繼續」 |
+| **非 codex 路徑** | in-memory cache pin first-call 的 `time.Now().UnixMilli()`，**兩個 stream 的 cache key 含各自的 namespace**，所以兩個 stream 各 pin 自己的 timestamp，TTL 1 小時 | **重啟後兩個 stream 各自重新 pin**；上游視角等同「同一個 client 開了新 session」（合理行為） |
 
 非 codex 路徑跨重啟換 session_id 是 v7 mimic 的代價。對 prompt cache 命中率影響有限——proxy 重啟通常意味新進程、上游連線重來，cache miss 是預期行為。
 

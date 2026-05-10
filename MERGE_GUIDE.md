@@ -30,11 +30,18 @@
 | `cacheHelper` 接受 `auth *cliproxyauth.Auth` 參數 | `internal/runtime/executor/codex_executor.go` 的 `cacheHelper` 函式 signature |
 | `applyCodexPromptCacheHeaders` 接受 `ctx` 與 `auth` 參數 | `internal/runtime/executor/codex_websockets_executor.go` 的同名函式 signature |
 | 三個 HTTP / 兩個 websocket callsite 把 auth 傳進去 | grep `cacheHelper(ctx,` / `applyCodexPromptCacheHeaders(ctx,` |
-| `derivePerAuthSessionID(cache.ID, auth)` 在 cache.ID 設值之後、寫到 body / header 之前被呼叫 | 兩個 cacheHelper 函式內 |
-| `applyCodexHeaders` 內對 `Session_id` 的後處理是「target 已有就不動」(不會被 `misc.EnsureHeader` 用 ginHeaders 覆蓋) | `codex_executor.go` 內 `if strings.TrimSpace(r.Header.Get("Session_id")) == ""` 那段 |
-| **`derivePerAuthSessionID` 輸出永遠是合法 UUIDv7，且 timestamp 落在最近合理範圍** | `codex_session_id.go` 內版本 bits 強制 7、variant 強制 RFC4122、前 48 bit 是 timestamp（borrow inbound v7 / cache 的 `time.Now().UnixMilli()`）；regression test `assertCodexV7Mimic` 會在每個 scenario 自動驗證 |
-| **若 inbound `originalID` 是合法 v7，輸出 v7 timestamp 必須等於 inbound v7 timestamp** | `codex_session_id.go` 內 `if inU.Version()==7 { timestampMs = extractV7TimestampMs(inU) }`；`TestCodexExecutorCacheHelper_DirectCodex_MirrorsInboundV7Timestamp` 自動驗證 |
-| **derivePerAuthSessionID 輸出對 `(originalID, auth.ID)` 配對在進程 lifetime 內 deterministic** | `codex_executor_cache_test.go` 的 `_StableWithinAuth` 子測試；timestamp cache TTL = 1h，cache 內重用 |
+| **存在兩個獨立 derive 函式** `derivedSessionID` / `derivedThreadID`，namespace 不同 | `internal/runtime/executor/codex_session_id.go` 的 `derivedSessionNamespace` 跟 `derivedThreadNamespace` 兩個常數 + `derivedSessionID` / `derivedThreadID` 兩個函式 |
+| **對任何 (originalID, auth.ID)，`derivedSessionID(...) ≠ derivedThreadID(...)`** | `TestDerive_CrossStream_AlwaysDistinct_*`（兩個子測試各跑 50 次） |
+| cacheHelper 用 `derivedSessionID` 寫 `Session_id` header、用 `derivedThreadID` 寫 `Thread_id` / `X-Client-Request-Id` headers + body `prompt_cache_key` | grep `derivedSessionID\|derivedThreadID` 兩個 cacheHelper 函式內 |
+| codex 直連路徑分別讀 inbound `Session_id` 與 `Thread_id` 兩個 header（real Codex CLI 兩個都送） | cacheHelper 內 `sessionInput, threadInput := ...` 區段，HTTP 用 `ginCtx.GetHeader`、WS 用 `headerValueCaseInsensitive` |
+| `applyCodexHeaders` 對 `Session_id` / `Thread_id` / `X-Client-Request-Id` 的後處理都是「target 已有就不動」(不會被 `misc.EnsureHeader` 用 ginHeaders 覆蓋) | `codex_executor.go` 內 `if strings.TrimSpace(r.Header.Get(...)) == ""` 那幾段 |
+| `applyCodexWebsocketHeaders` 對 `session_id` / `thread_id` / `x-client-request-id` 也有對應保護 | `codex_websockets_executor.go` 內 `ensureHeaderCasePreserved(... "session_id" ...)` / `... "thread_id" ...` 跟 `if strings.TrimSpace(headerValueCaseInsensitive(headers, "x-client-request-id")) == ""` |
+| **`Conversation_id` header 必須不被送出**（real Codex CLI 不送） | grep 應該找不到 `headers.Set("Conversation_id"` 或 `setHeaderCasePreserved(... "Conversation_id"` |
+| **derive 輸出永遠是合法 UUIDv7，timestamp 落在最近合理範圍** | `codex_session_id.go` 內 version bits 強制 7、variant 強制 RFC4122、前 48 bit 是 timestamp（borrow inbound v7 / cache 的 `time.Now().UnixMilli()`）；regression test `assertCodexV7Mimic` 會在每個 scenario 對 Session_id + Thread_id + prompt_cache_key 自動驗證 |
+| **若 inbound 是合法 v7，輸出 v7 timestamp 必須等於 inbound 對應 stream 的 v7 timestamp** | `codex_session_id.go` 內 `if inU.Version()==7 { timestampMs = extractV7TimestampMs(inU) }`；`TestCodexExecutorCacheHelper_DirectCodex_MirrorsInboundV7Timestamp` 用兩個 inbound v7（各送 Session_id 與 Thread_id）自動驗證 |
+| **derive 輸出對 `(originalID, auth.ID)` 配對在進程 lifetime 內 deterministic** | `TestDerive_Deterministic_*` 跨 50 次呼叫驗證；timestamp cache TTL = 1h，cache 內重用 |
+| **`Thread_id == X-Client-Request-Id == prompt_cache_key`**（real Codex CLI 三個都用 state.thread_id） | regression test 對每個 record 都跑 `tid != xrid` / `tid != pck` 失敗 |
+| **`Session_id ≠ prompt_cache_key`**（real Codex CLI 永不會等於） | regression test 對每個 record 都跑 `sid == pck` 失敗 |
 
 ### L4 不變式
 

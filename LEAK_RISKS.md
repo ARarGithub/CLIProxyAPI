@@ -61,25 +61,31 @@ OpenAI 隨時可以對歷史日誌跑「同一 session_id 下出現 ≥2 個 acc
 選 (1) 對使用者體驗影響最小，且不會降低 prompt cache 命中率（cache 本來就是 per-account）。
 
 ### 已採用方案（fork-local patch）
-**(1) per-auth derive + v7 mimic**，覆蓋 HTTP / websocket 兩條路徑的所有 `from` 分支與直連 Codex CLI：
+**(1) per-auth derive + v7 mimic + 雙 stream（session_id / thread_id 獨立）**，覆蓋 HTTP / websocket 兩條路徑的所有 `from` 分支與直連 Codex CLI：
 
-- 新增 `internal/runtime/executor/codex_session_id.go` — `derivePerAuthSessionID(originalID, auth)` 把 `(originalID, auth.ID)` 衍生成一個**看起來像真實 Codex CLI session id 的 UUIDv7**：
-  - 第 14 位永遠是 `7`（real Codex CLI 用 `Uuid::now_v7()`，見 codex-rs/protocol/src/session_id.rs）
-  - 第 19 位是 RFC4122 variant（`8`/`9`/`a`/`b`）
-  - 前 48 bit timestamp：codex 直連路徑直接借用 client 送進來的 v7 timestamp（cross-restart deterministic、跟 client 的「session 開始時間」一致）；其他路徑用 in-memory cache pin 第一次的 `time.Now().UnixMilli()` 並在 1 小時 TTL 內重用
-  - 其餘 80 bit (rand_a + rand_b) = `SHA1("cli-proxy-api:codex:per-auth:v7:" + originalID + ":" + auth.ID)`，cross-auth 一定不同
+- 新增 `internal/runtime/executor/codex_session_id.go` — 兩個 derive helper，把 `(originalID, auth.ID)` 衍生成兩個**獨立、看起來像真實 Codex CLI session id 的 UUIDv7**：
+  - `derivedSessionID(originalID, auth)` — 給 upstream 的 `Session_id` / `session_id` headers（`Session-id` 也走同一條）
+  - `derivedThreadID(originalID, auth)` — 給 `Thread_id` / `thread_id` / `X-Client-Request-Id` headers AND body 的 `prompt_cache_key`（real Codex CLI 用 thread_id 字串當 prompt_cache_key，**不是 session_id**）
+  - 兩個函式內部用不同 namespace（`...:session_id:v7` vs `...:thread_id:v7`），所以**對任何 (originalID, auth.ID) 都保證 derivedSessionID ≠ derivedThreadID**——避免「Session_id == prompt_cache_key」這個 real Codex CLI 永不會出現的 fingerprint
+  - 兩個輸出都是合法 UUIDv7：第 14 位永遠是 `7`、第 19 位是 RFC4122 variant、前 48 bit timestamp（codex 直連借用 client 的 v7 timestamp；其他路徑用 in-memory cache 各自獨立 pin）
+  - 其餘 80 bit (rand_a + rand_b) = `SHA1(namespace + ":" + originalID + ":" + auth.ID)`，cross-auth 一定不同
   - `auth` 為 nil 或 `auth.ID` 為空時 no-op（測試友善）
-- `cacheHelper`（`internal/runtime/executor/codex_executor.go`）改 signature 接 `auth`，並在原本 claude/openai/openai-response 三條分支沒推導出 cache.ID 時，從 body `prompt_cache_key` / gin header `Session_id` 折回（涵蓋 Codex CLI 直連），最後一律 derive。Body `prompt_cache_key` 與 header `Session_id` 同步覆寫。
-- `applyCodexHeaders`（`codex_executor.go:810-819`）的 `Session_id` 後處理改成「target 已有就不動」，避免 `misc.EnsureHeader` source-first 行為把 cacheHelper 已 derive 過的值用 ginHeaders 原值覆蓋回去。
-- `applyCodexPromptCacheHeaders`（`internal/runtime/executor/codex_websockets_executor.go`）做同樣處理，涵蓋 websocket 路徑；`Conversation_id` 也同步覆寫。
+- `cacheHelper`（`codex_executor.go`）改 signature 接 `auth`，並在 codex 直連路徑分別讀 inbound `Session_id` 與 `Thread_id` 兩個 header（real Codex CLI 兩個都送）；非 codex 路徑用同一個 cache.ID 餵兩個 stream（namespace 隔離保證輸出不同）。寫出三筆對齊的值：body `prompt_cache_key = threadDerived`、header `Session_id = sessionDerived`、header `Thread_id = X-Client-Request-Id = threadDerived`。
+- `applyCodexHeaders` 的 `Session_id` / `Thread_id` / `X-Client-Request-Id` 後處理都改成「target 已有就不動」，避免 `misc.EnsureHeader` 的 source-first 行為把 cacheHelper 已 derive 過的值用 ginHeaders 原值覆蓋回去。
+- `applyCodexPromptCacheHeaders`（websocket 路徑）做同樣處理：兩個 stream + 兩條 ginHeaders 讀取（lowercase `session_id` / `thread_id`）+ **移除 `Conversation_id` header**（real Codex CLI 從不送這個 header，是上游 fork 自己加的）。
+- `applyCodexWebsocketHeaders` 也加 `thread_id` 的 fallback case-preserved 處理 + gate `x-client-request-id` 的 EnsureHeader 不蓋掉 derived 值。
 - 三個 HTTP `cacheHelper` callsite 與兩個 websocket callsite 同步傳 `auth`。
-- 單元測試：`codex_executor_cache_test.go` 的三個結構性測試（cross-auth 不同、within-auth 穩定、direct codex 借用 v7 timestamp、輸出永遠通過 `assertLooksLikeRealCodexSessionID`）；`codex_websockets_executor_test.go` 的對應 websocket 測試。
-- **回歸測試**：`internal/runtime/executor/codex_fingerprint_regression_test.go` — `TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation`。透過 `httptest.Server` 模擬 Codex 上游，對四種 inbound client 格式（codex direct / openai-response / openai chat / claude）各跑兩個 auth，驗證：
-  1. cross-auth `Session_id` / `prompt_cache_key` / `Conversation_id` / `previous_response_id` 必須不同（L1 主訴求）
-  2. **每個 outbound `Session_id` 與 `prompt_cache_key` 必須通過 `assertCodexV7Mimic`**：是合法 v7 UUID + variant 對 + timestamp 落在最近 30 天（v7 mimic 主訴求，避免上游用「decode timestamp 看年份」一秒露餡）
-  3. 通用掃描所有 header 與 body top-level key，把跨 auth 同值的非預期欄位用 `t.Logf` 標出來供 review
+- 單元測試 `codex_session_id_test.go`：14 個測試 §1 Determinism / §2 Auth-switching round-trip / §3 Timestamp correctness / §4 Cross-input distinctness / §5 **Cross-stream distinctness（derivedSessionID ≠ derivedThreadID）** / §6 Edge cases / §7 Structural validity / §8 Concurrency safety
+- `codex_executor_cache_test.go` 的三個整合測試 + `codex_websockets_executor_test.go` 的兩個 websocket 測試都改寫成新雙 stream 斷言（包含「Session_id 必不等於 prompt_cache_key」、「Thread_id == X-Client-Request-Id == prompt_cache_key」、「Conversation_id 必不存在」）。
+- **回歸測試**：`codex_fingerprint_regression_test.go` 對四種 inbound client 格式各跑兩個 auth，驗證：
+  1. cross-auth：`Session_id` / `Thread_id` / `X-Client-Request-Id` / `prompt_cache_key` / `previous_response_id` 必須不同
+  2. **`Session_id ≠ prompt_cache_key`**（real Codex CLI 不會等於）
+  3. **`Thread_id == X-Client-Request-Id == prompt_cache_key`**（real Codex CLI 三個都用 state.thread_id）
+  4. **`Conversation_id` 必須不存在**（real Codex CLI 不送這個 header）
+  5. 每個 outbound `Session_id` / `Thread_id` / `prompt_cache_key` 必須通過 `assertCodexV7Mimic`：合法 v7 UUID + variant 對 + timestamp 落在最近 30 天
+  6. 通用掃描所有 header 與 body top-level key，跨 auth 同值的非預期欄位用 `t.Logf` 標出供 review
 
-每次新增功能或修改 Codex 路徑後跑這個測試可立刻看出新引入的 fingerprint 通道（包括「derive 函式被改回 v5 / v4」、「timestamp 不在合理範圍」這類 regression）。
+每次新增功能或修改 Codex 路徑後跑這個測試可立刻看出新引入的 fingerprint 通道。
 
 **未涵蓋**：Claude / Antigravity / Gemini / Kimi 後端。Codex/OpenAI 後端是這次 fork 的 patch 範圍。
 

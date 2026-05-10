@@ -764,35 +764,49 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		}
 	}
 
-	// For paths cacheHelper does not derive (mainly direct Codex CLI), inherit
-	// session_id from the inbound body / header so the per-auth re-derivation
-	// below can break cross-account continuity.
-	if cache.ID == "" {
-		if pck := gjson.GetBytes(rawJSON, "prompt_cache_key"); pck.Exists() {
-			if pckStr := strings.TrimSpace(pck.String()); pckStr != "" {
-				cache.ID = pckStr
-			}
-		}
-	}
+	// For codex direct path, real Codex CLI sends DISTINCT session_id and
+	// thread_id headers (plus thread_id is also the body's prompt_cache_key).
+	// Extract them separately so the two derive streams below can carry the
+	// inbound timestamps independently. For non-codex paths the synthesised
+	// cache.ID is used for both streams (the namespace separation in
+	// derive*ID guarantees the outputs differ).
+	sessionInput, threadInput := cache.ID, cache.ID
 	if cache.ID == "" {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			if sid := strings.TrimSpace(ginCtx.GetHeader("Session_id")); sid != "" {
-				cache.ID = sid
+			sessionInput = strings.TrimSpace(ginCtx.GetHeader("Session_id"))
+			threadInput = strings.TrimSpace(ginCtx.GetHeader("Thread_id"))
+		}
+		if threadInput == "" {
+			if pck := gjson.GetBytes(rawJSON, "prompt_cache_key"); pck.Exists() {
+				if pckStr := strings.TrimSpace(pck.String()); pckStr != "" {
+					threadInput = pckStr
+				}
 			}
+		}
+		if sessionInput == "" {
+			sessionInput = threadInput
+		}
+		if threadInput == "" {
+			threadInput = sessionInput
 		}
 	}
 
-	cache.ID = derivePerAuthSessionID(cache.ID, auth)
+	sessionDerived := derivedSessionID(sessionInput, auth)
+	threadDerived := derivedThreadID(threadInput, auth)
 
-	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+	if threadDerived != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", threadDerived)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, err
 	}
-	if cache.ID != "" {
-		httpReq.Header.Set("Session_id", cache.ID)
+	if sessionDerived != "" {
+		httpReq.Header.Set("Session_id", sessionDerived)
+	}
+	if threadDerived != "" {
+		httpReq.Header.Set("Thread_id", threadDerived)
+		httpReq.Header.Set("X-Client-Request-Id", threadDerived)
 	}
 	return httpReq, nil
 }
@@ -811,18 +825,27 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+	// X-Client-Request-Id: cacheHelper writes the per-auth derived thread id
+	// here. Only fall back to ginHeaders if cacheHelper did not. (Mirrors the
+	// Session_id pattern below — never let misc.EnsureHeader clobber a derived
+	// value with the raw inbound, which would leak the cross-auth correlation.)
+	if strings.TrimSpace(r.Header.Get("X-Client-Request-Id")) == "" {
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+	}
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 
 	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		// cacheHelper has already set Session_id (with per-auth derivation)
-		// for any request where a session source existed. Only fall back to a
-		// fresh UUID when nothing is set — never let misc.EnsureHeader pull
-		// the raw inbound Session_id and clobber the derived one, which would
+		// cacheHelper has already set Session_id and Thread_id (with per-auth
+		// derivation) for any request where a session source existed. Only fall
+		// back to fresh UUIDs when nothing is set — never let misc.EnsureHeader
+		// pull raw inbound values and clobber the derived ones, which would
 		// re-leak the cross-auth correlation. See LEAK_RISKS.md L1.
 		if strings.TrimSpace(r.Header.Get("Session_id")) == "" {
 			r.Header.Set("Session_id", uuid.NewString())
+		}
+		if strings.TrimSpace(r.Header.Get("Thread_id")) == "" {
+			r.Header.Set("Thread_id", uuid.NewString())
 		}
 	}
 

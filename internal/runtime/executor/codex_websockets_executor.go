@@ -830,31 +830,50 @@ func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format
 		}
 	}
 
-	// Inherit session_id from inbound body / header for the direct Codex CLI
-	// websocket path so per-auth re-derivation can break cross-account
-	// continuity. See LEAK_RISKS.md L1.
-	if cache.ID == "" {
-		if pck := gjson.GetBytes(rawJSON, "prompt_cache_key"); pck.Exists() {
-			if pckStr := strings.TrimSpace(pck.String()); pckStr != "" {
-				cache.ID = pckStr
-			}
-		}
-	}
+	// For codex direct WS path, real Codex CLI sends DISTINCT session_id and
+	// thread_id headers. Extract them separately so each derive stream can
+	// carry the inbound timestamp independently. For non-codex paths we share
+	// cache.ID across both streams (the namespace separation in derive*ID
+	// guarantees the outputs differ). See LEAK_RISKS.md L1, CODEX_CLI_REFERENCE.md.
+	sessionInput, threadInput := cache.ID, cache.ID
 	if cache.ID == "" {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			if sid := strings.TrimSpace(headerValueCaseInsensitive(ginCtx.Request.Header, "session_id")); sid != "" {
-				cache.ID = sid
+			sessionInput = strings.TrimSpace(headerValueCaseInsensitive(ginCtx.Request.Header, "session_id"))
+			threadInput = strings.TrimSpace(headerValueCaseInsensitive(ginCtx.Request.Header, "thread_id"))
+		}
+		if threadInput == "" {
+			if pck := gjson.GetBytes(rawJSON, "prompt_cache_key"); pck.Exists() {
+				if pckStr := strings.TrimSpace(pck.String()); pckStr != "" {
+					threadInput = pckStr
+				}
 			}
+		}
+		if sessionInput == "" {
+			sessionInput = threadInput
+		}
+		if threadInput == "" {
+			threadInput = sessionInput
 		}
 	}
 
-	cache.ID = derivePerAuthSessionID(cache.ID, auth)
+	sessionDerived := derivedSessionID(sessionInput, auth)
+	threadDerived := derivedThreadID(threadInput, auth)
 
-	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
-		setHeaderCasePreserved(headers, "session_id", cache.ID)
-		headers.Set("Conversation_id", cache.ID)
+	if threadDerived != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", threadDerived)
 	}
+	if sessionDerived != "" {
+		setHeaderCasePreserved(headers, "session_id", sessionDerived)
+	}
+	if threadDerived != "" {
+		setHeaderCasePreserved(headers, "thread_id", threadDerived)
+		setHeaderCasePreserved(headers, "x-client-request-id", threadDerived)
+	}
+	// NOTE: previously this function also set a `Conversation_id` header to the
+	// same value. Real Codex CLI never sends that header (verified against
+	// codex-rs/core/src/client.rs:build_websocket_headers, see
+	// CODEX_CLI_REFERENCE.md §A). Sending it was itself a fingerprint, so it is
+	// no longer emitted.
 
 	return rawJSON, headers
 }
@@ -877,7 +896,14 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
+	// x-client-request-id: applyCodexPromptCacheHeaders writes the per-auth
+	// derived thread id here. Only fall back to ginHeaders if it didn't.
+	// (Mirrors session_id below — never let misc.EnsureHeader's source-first
+	// behaviour clobber a derived value with the raw inbound, which would
+	// re-leak the cross-auth correlation.)
+	if strings.TrimSpace(headerValueCaseInsensitive(headers, "x-client-request-id")) == "" {
+		misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
+	}
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
 	if isAPIKey {
@@ -896,8 +922,10 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	headers.Set("OpenAI-Beta", betaHeader)
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
 		ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", uuid.NewString())
+		ensureHeaderCasePreserved(headers, ginHeaders, "thread_id", "", uuid.NewString())
 	}
 	ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", "")
+	ensureHeaderCasePreserved(headers, ginHeaders, "thread_id", "", "")
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {

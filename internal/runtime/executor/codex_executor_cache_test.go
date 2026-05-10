@@ -16,10 +16,10 @@ import (
 )
 
 // All assertions in this file deliberately check STRUCTURAL properties of the
-// derived Session_id (cross-auth distinct, within-auth stable, body matches
-// header, valid v7 UUID with recent timestamp) rather than hardcoding a
-// specific SHA1-derived value. The derive algorithm is allowed to change as
-// long as these properties hold.
+// derived Session_id / Thread_id / prompt_cache_key (cross-auth distinct,
+// within-auth stable, valid v7 UUID with recent timestamp, Session_id !=
+// prompt_cache_key) rather than hardcoding a specific SHA1-derived value.
+// The derive algorithm is allowed to change as long as these properties hold.
 
 func TestCodexExecutorCacheHelper_OpenAIChat_StableWithinAuth(t *testing.T) {
 	recorder := httptest.NewRecorder()
@@ -42,23 +42,36 @@ func TestCodexExecutorCacheHelper_OpenAIChat_StableWithinAuth(t *testing.T) {
 	}
 	body1, _ := io.ReadAll(httpReq1.Body)
 	sid1 := httpReq1.Header.Get("Session_id")
+	tid1 := httpReq1.Header.Get("Thread_id")
+	xrid1 := httpReq1.Header.Get("X-Client-Request-Id")
 	pck1 := gjson.GetBytes(body1, "prompt_cache_key").String()
 
-	if sid1 == "" {
-		t.Fatal("Session_id missing")
+	for _, v := range []string{sid1, tid1, xrid1, pck1} {
+		if v == "" {
+			t.Fatalf("missing required value: sid=%q tid=%q xrid=%q pck=%q", sid1, tid1, xrid1, pck1)
+		}
 	}
-	if sid1 != pck1 {
-		t.Fatalf("body prompt_cache_key (%q) must match header Session_id (%q)", pck1, sid1)
+	if sid1 == pck1 {
+		t.Fatalf("Session_id (%q) == prompt_cache_key — real Codex CLI never makes them equal", sid1)
+	}
+	if tid1 != pck1 {
+		t.Fatalf("Thread_id (%q) must equal prompt_cache_key (%q) — real Codex CLI uses thread_id as prompt_cache_key", tid1, pck1)
+	}
+	if xrid1 != tid1 {
+		t.Fatalf("X-Client-Request-Id (%q) must equal Thread_id (%q) — real Codex CLI uses thread_id as x-client-request-id", xrid1, tid1)
 	}
 	assertLooksLikeRealCodexSessionID(t, sid1)
+	assertLooksLikeRealCodexSessionID(t, tid1)
 
 	httpReq2, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON, auth)
 	if err != nil {
 		t.Fatalf("cacheHelper error (second call): %v", err)
 	}
-	sid2 := httpReq2.Header.Get("Session_id")
-	if sid1 != sid2 {
+	if sid2 := httpReq2.Header.Get("Session_id"); sid1 != sid2 {
 		t.Fatalf("Session_id must be stable across calls with same auth: %q vs %q", sid1, sid2)
+	}
+	if tid2 := httpReq2.Header.Get("Thread_id"); tid1 != tid2 {
+		t.Fatalf("Thread_id must be stable across calls with same auth: %q vs %q", tid1, tid2)
 	}
 }
 
@@ -88,41 +101,60 @@ func TestCodexExecutorCacheHelper_PerAuthSessionIDDiffersAcrossAuths(t *testing.
 		t.Fatalf("cacheHelper(authB) error: %v", err)
 	}
 
-	sidA := reqA.Header.Get("Session_id")
-	sidB := reqB.Header.Get("Session_id")
-	if sidA == "" || sidB == "" {
-		t.Fatalf("Session_id missing: A=%q B=%q", sidA, sidB)
+	bodyA, _ := io.ReadAll(reqA.Body)
+	bodyB, _ := io.ReadAll(reqB.Body)
+	sidA, sidB := reqA.Header.Get("Session_id"), reqB.Header.Get("Session_id")
+	tidA, tidB := reqA.Header.Get("Thread_id"), reqB.Header.Get("Thread_id")
+	pckA := gjson.GetBytes(bodyA, "prompt_cache_key").String()
+	pckB := gjson.GetBytes(bodyB, "prompt_cache_key").String()
+
+	for _, v := range []string{sidA, sidB, tidA, tidB, pckA, pckB} {
+		if v == "" {
+			t.Fatalf("missing required value: sidA=%q sidB=%q tidA=%q tidB=%q pckA=%q pckB=%q", sidA, sidB, tidA, tidB, pckA, pckB)
+		}
 	}
 	if sidA == sidB {
-		t.Fatalf("Session_id leaked across auths: A=B=%q (must differ)", sidA)
+		t.Fatalf("Session_id leaked across auths: A=B=%q", sidA)
+	}
+	if tidA == tidB {
+		t.Fatalf("Thread_id leaked across auths: A=B=%q", tidA)
+	}
+	if pckA == pckB {
+		t.Fatalf("prompt_cache_key leaked across auths: A=B=%q", pckA)
+	}
+	if sidA == tidA || sidB == tidB {
+		t.Fatalf("Session_id == Thread_id (A: %q vs %q; B: %q vs %q) — real Codex CLI never makes them equal", sidA, tidA, sidB, tidB)
+	}
+	if pckA != tidA || pckB != tidB {
+		t.Fatalf("prompt_cache_key must equal Thread_id (A: %q vs %q; B: %q vs %q)", pckA, tidA, pckB, tidB)
 	}
 	assertLooksLikeRealCodexSessionID(t, sidA)
 	assertLooksLikeRealCodexSessionID(t, sidB)
-
-	bodyA, _ := io.ReadAll(reqA.Body)
-	bodyB, _ := io.ReadAll(reqB.Body)
-	pckA := gjson.GetBytes(bodyA, "prompt_cache_key").String()
-	pckB := gjson.GetBytes(bodyB, "prompt_cache_key").String()
-	if pckA == pckB {
-		t.Fatalf("prompt_cache_key leaked across auths: A=B=%q (must differ)", pckA)
-	}
-	if pckA != sidA || pckB != sidB {
-		t.Fatalf("body prompt_cache_key must match header Session_id (A: %q vs %q; B: %q vs %q)", pckA, sidA, pckB, sidB)
-	}
+	assertLooksLikeRealCodexSessionID(t, tidA)
+	assertLooksLikeRealCodexSessionID(t, tidB)
 }
 
 func TestCodexExecutorCacheHelper_DirectCodex_MirrorsInboundV7Timestamp(t *testing.T) {
-	// Codex CLI sends a fresh UUIDv7 per session. The proxy should produce a
-	// derived UUID that (a) carries the SAME timestamp as the inbound (so it
-	// looks like the same session that started at the same wall-clock time),
-	// (b) differs across auths in the random portion, (c) does NOT pass the
-	// raw inbound through.
-	inboundV7 := uuid.Must(uuid.NewV7()).String()
+	// Codex CLI sends a fresh UUIDv7 per session_id AND another fresh UUIDv7
+	// per thread_id (two independent client-side now_v7() calls). The proxy
+	// must produce derived UUIDs that:
+	//   (a) borrow each inbound v7's timestamp into the corresponding stream
+	//       (Session_id derived borrows from inbound Session_id, Thread_id
+	//       derived borrows from inbound Thread_id);
+	//   (b) differ across auths in the random portion;
+	//   (c) NEVER pass the raw inbound through;
+	//   (d) keep Session_id != Thread_id (they're different streams).
+	inboundSessionV7 := uuid.Must(uuid.NewV7()).String()
+	inboundThreadV7 := uuid.Must(uuid.NewV7()).String()
+	if inboundSessionV7 == inboundThreadV7 {
+		t.Fatalf("setup: expected two different v7 inputs")
+	}
 
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Request = httptest.NewRequest("POST", "/", nil)
-	ginCtx.Request.Header.Set("Session_id", inboundV7)
+	ginCtx.Request.Header.Set("Session_id", inboundSessionV7)
+	ginCtx.Request.Header.Set("Thread_id", inboundThreadV7)
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	executor := &CodexExecutor{}
@@ -142,29 +174,45 @@ func TestCodexExecutorCacheHelper_DirectCodex_MirrorsInboundV7Timestamp(t *testi
 		t.Fatalf("cacheHelper(authB) error: %v", err)
 	}
 
-	sidA := reqA.Header.Get("Session_id")
-	sidB := reqB.Header.Get("Session_id")
-	if sidA == "" || sidB == "" {
-		t.Fatalf("direct path did not set Session_id: A=%q B=%q", sidA, sidB)
+	sidA, sidB := reqA.Header.Get("Session_id"), reqB.Header.Get("Session_id")
+	tidA, tidB := reqA.Header.Get("Thread_id"), reqB.Header.Get("Thread_id")
+
+	for _, v := range []string{sidA, sidB, tidA, tidB} {
+		if v == "" {
+			t.Fatalf("missing required value: sidA=%q sidB=%q tidA=%q tidB=%q", sidA, sidB, tidA, tidB)
+		}
 	}
-	if sidA == inboundV7 || sidB == inboundV7 {
-		t.Fatalf("direct path forwarded raw client v7 without derivation: A=%q B=%q inbound=%q", sidA, sidB, inboundV7)
+	for _, raw := range []string{inboundSessionV7, inboundThreadV7} {
+		if sidA == raw || sidB == raw || tidA == raw || tidB == raw {
+			t.Fatalf("direct path forwarded raw client v7 without derivation (raw=%q)", raw)
+		}
 	}
 	if sidA == sidB {
-		t.Fatalf("direct path leaked session_id across auths: %q", sidA)
+		t.Fatalf("session stream leaked across auths: %q", sidA)
+	}
+	if tidA == tidB {
+		t.Fatalf("thread stream leaked across auths: %q", tidA)
+	}
+	if sidA == tidA || sidB == tidB {
+		t.Fatalf("Session_id == Thread_id within one auth (A: %q vs %q; B: %q vs %q)", sidA, tidA, sidB, tidB)
 	}
 
-	// Both derived UUIDs should look like real v7 sessions...
-	assertLooksLikeRealCodexSessionID(t, sidA)
-	assertLooksLikeRealCodexSessionID(t, sidB)
+	for _, v := range []string{sidA, sidB, tidA, tidB} {
+		assertLooksLikeRealCodexSessionID(t, v)
+	}
 
-	// ...and specifically should have the SAME timestamp as the inbound.
-	inU := uuid.MustParse(inboundV7)
-	wantTS := extractV7TimestampMs(inU)
+	// Cross-stream timestamp mirroring: each derived stream's timestamp must
+	// match the corresponding inbound stream's timestamp.
+	wantSessionTS := extractV7TimestampMs(uuid.MustParse(inboundSessionV7))
+	wantThreadTS := extractV7TimestampMs(uuid.MustParse(inboundThreadV7))
 	for _, sid := range []string{sidA, sidB} {
-		gotU := uuid.MustParse(sid)
-		if gotTS := extractV7TimestampMs(gotU); gotTS != wantTS {
-			t.Fatalf("derived v7 timestamp %d does not match inbound %d (sid=%s)", gotTS, wantTS, sid)
+		if gotTS := extractV7TimestampMs(uuid.MustParse(sid)); gotTS != wantSessionTS {
+			t.Errorf("session stream timestamp %d does not match inbound session %d (sid=%s)", gotTS, wantSessionTS, sid)
+		}
+	}
+	for _, tid := range []string{tidA, tidB} {
+		if gotTS := extractV7TimestampMs(uuid.MustParse(tid)); gotTS != wantThreadTS {
+			t.Errorf("thread stream timestamp %d does not match inbound thread %d (tid=%s)", gotTS, wantThreadTS, tid)
 		}
 	}
 }

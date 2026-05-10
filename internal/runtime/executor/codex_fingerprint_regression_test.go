@@ -76,10 +76,12 @@ type fingerprintField struct {
 // Add a new entry whenever code introduces another conversation / session /
 // cache identifier that reaches the upstream.
 var crossAuthLeakFields = []fingerprintField{
-	{inHeader, "Session_id", "Codex session identifier"},
-	{inHeader, "session_id", "Codex session identifier (lowercase variant)"},
-	{inHeader, "Conversation_id", "Codex websocket conversation identifier"},
-	{inBody, "prompt_cache_key", "Codex prompt cache key"},
+	{inHeader, "Session_id", "Codex session identifier (HTTP)"},
+	{inHeader, "session_id", "Codex session identifier (lowercase, WS)"},
+	{inHeader, "Thread_id", "Codex thread identifier (HTTP)"},
+	{inHeader, "thread_id", "Codex thread identifier (lowercase, WS)"},
+	{inHeader, "X-Client-Request-Id", "Codex per-thread request id (= thread_id in real Codex CLI)"},
+	{inBody, "prompt_cache_key", "Codex prompt cache key (= thread_id in real Codex CLI)"},
 	{inBody, "previous_response_id", "Trivially correlates conversation turns across accounts"},
 }
 
@@ -266,16 +268,51 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 				}
 			}
 
-			// Structural v7 mimic check: every upstream-bound Session_id (and
-			// the matching body prompt_cache_key) must look like a real Codex
-			// CLI v7 UUID. A v5 / v4 / random-timestamp-v7 leaks the proxy by
-			// trivial inspection. See LEAK_RISKS.md L1.
+			// Structural v7 mimic check: every upstream-bound Session_id and
+			// Thread_id (and the matching body prompt_cache_key) must look
+			// like a real Codex CLI v7 UUID. A v5 / v4 / random-timestamp-v7
+			// leaks the proxy by trivial inspection. See LEAK_RISKS.md L1.
 			for _, rec := range []recordedUpstreamRequest{recordA, recordB} {
 				if sid := rec.Headers.Get("Session_id"); sid != "" {
 					assertCodexV7Mimic(t, "header Session_id", sid)
 				}
+				if tid := rec.Headers.Get("Thread_id"); tid != "" {
+					assertCodexV7Mimic(t, "header Thread_id", tid)
+				}
 				if pck := gjson.GetBytes(rec.Body, "prompt_cache_key").String(); pck != "" {
 					assertCodexV7Mimic(t, "body prompt_cache_key", pck)
+				}
+
+				// Cross-stream: Session_id and prompt_cache_key (= thread_id)
+				// must NEVER be equal. Real Codex CLI's session_id and
+				// thread_id are independent v7 UUIDs; equality would itself
+				// be a fingerprint. See LEAK_RISKS.md L1, CODEX_CLI_REFERENCE.md.
+				sid := rec.Headers.Get("Session_id")
+				pck := gjson.GetBytes(rec.Body, "prompt_cache_key").String()
+				if sid != "" && pck != "" && sid == pck {
+					t.Errorf("LEAK: Session_id (%q) == prompt_cache_key (%q) — real Codex CLI never makes them equal", sid, pck)
+				}
+				tid := rec.Headers.Get("Thread_id")
+				if sid != "" && tid != "" && sid == tid {
+					t.Errorf("LEAK: Session_id (%q) == Thread_id (%q) — real Codex CLI never makes them equal", sid, tid)
+				}
+				// thread_id family invariant: thread_id == prompt_cache_key
+				// == x-client-request-id (real Codex CLI ties all three to
+				// state.thread_id).
+				if tid != "" && pck != "" && tid != pck {
+					t.Errorf("INCONSISTENT: Thread_id (%q) != prompt_cache_key (%q) — must be the same string", tid, pck)
+				}
+				if xrid := rec.Headers.Get("X-Client-Request-Id"); xrid != "" && tid != "" && xrid != tid {
+					t.Errorf("INCONSISTENT: X-Client-Request-Id (%q) != Thread_id (%q) — real Codex CLI sets x-client-request-id = thread_id", xrid, tid)
+				}
+
+				// Negative assertion: Conversation_id must NOT be sent. Real
+				// Codex CLI never emits this header (verified against
+				// codex-rs/core/src/client.rs:build_websocket_headers, see
+				// CODEX_CLI_REFERENCE.md §A). The original CLIProxyAPI
+				// fabricated it; we must not.
+				if cid := rec.Headers.Get("Conversation_id"); cid != "" {
+					t.Errorf("LEAK: Conversation_id = %q present — real Codex CLI never sends this header", cid)
 				}
 			}
 
