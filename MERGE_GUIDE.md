@@ -126,12 +126,15 @@ go test ./internal/auth/codex/ -run 'NextRefreshLead'
 go test ./sdk/auth/ -run 'CodexAuthenticator_RefreshLead'
 go test ./sdk/cliproxy/auth/ -run 'JitteredNow'
 
-# 5d. 全測試（看是否引入新 regression；本 fork 預期 3 個既有失敗：
+# 5d. Smoke test — A→B→A 全 pipeline round-trip + 一條 pipeline wiring sanity
+go test ./internal/runtime/executor/ -run 'TestCodexSmoke' -v
+
+# 5e. 全測試（看是否引入新 regression；本 fork 預期 3 個既有失敗：
 #     antigravity_executor_credits_test.go x 2、registry/model_definitions_test.go x 1）
 go test ./... 2>&1 | tail -30
 ```
 
-**Gate 條件**：5a + 5b + 5c 必須全綠。5d 的失敗清單必須跟 merge 前一致（沒有「新增」的失敗）。
+**Gate 條件**：5a + 5b + 5c + 5d 必須全綠。5e 的失敗清單必須跟 merge 前一致（沒有「新增」的失敗）。
 
 ### Step 6 — Commit + push
 

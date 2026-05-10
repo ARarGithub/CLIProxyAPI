@@ -192,6 +192,28 @@ const codexUserAgent = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.
 ### Pool 指紋影響
 **低**：real Codex CLI 在同一台機器跨 OAuth 帳號也是同 UA（單機多帳號合法）。所以「N 個 auth 共用同 UA」不能單獨判定為 pool；要搭配其它 per-auth 應該不同的欄位（L1 / F / G / H 等已 derive 過）一起看才有 signal。**proxy 偵測**才是 L2 主要風險點，不是 pool join。
 
+### config vs inbound 取捨（已記，採取 A 不動策略）
+
+當 `config` 與 inbound 同時有 UA 時，**config 贏**（`ensureHeaderWithConfigPrecedence` 的設計）。這個取捨有兩面：
+
+- **對「非 codex 路徑」（openai-response / claude / openai chat → codex 後端）**：**好**。inbound 通常是 `OpenAI-Python/1.x` 之類非 Codex SDK 字串，config 強制塞一個 Codex CLI 形狀的 UA，蓋掉非 Codex UA，反而是 fingerprint 保護。
+- **對「codex 直連」**：**糟**。真 Codex CLI 客戶端送的是它當前的 UA（例如最新 `0.130.0`），config 若寫舊版 `0.118.0` 會把真客戶端的覆蓋掉 → outbound 看起來是舊版 Codex CLI（潛在 fingerprint）。
+
+**部署建議**：
+- 池化部署 + 用戶不直接連 Codex CLI（只走 openai-response / claude 等）→ **config 設一個合理 Codex UA**，有保護
+- 池化部署 + 用戶用真 Codex CLI 直連 → **config 不要設、留空**，讓 inbound 贏；fallback 觸發機率低
+- 兩種混用 → 沒完美解，要嘛 codex 直連被覆蓋（config 設）、要嘛非 codex 路徑用 fallback（config 不設）
+
+**目前決策**：採取 A —— **不動 precedence**。理由：
+1. 我們不知道用戶實際部署模式，貿然改 precedence 可能在某種模式變糟
+2. 抽離原則：改 precedence 要動 `applyCodexHeaders`（upstream 函式），增加 merge 衝突風險
+3. 上述 case 都比「fallback 觸發」好——L2 fallback 才是真正寫死的問題，先擺著
+
+未來若觀察到 traffic 異常被 reject、且歸因到 UA，再考慮：
+- **B**：改 inbound-first（破壞抽離 + 對非 codex 路徑變糟）
+- **C**：路徑分流（codex 直連 inbound-first；非 codex config-first；破壞抽離）
+- **D**：更新 hardcoded fallback 為 build-time variable（治標，跟 Codex CLI 版本同步升）
+
 ---
 
 ## 🟠 L3：Antigravity / Claude / Kimi 預設 OS 指紋寫死
