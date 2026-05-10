@@ -141,6 +141,69 @@ WS request body 的 `client_metadata` 比 HTTP 更豐富：
 
 ---
 
+## 3.5 完整值目錄（real Codex CLI 對 chatgpt.com / api.openai.com 上游送的所有值）
+
+> 一個 value 一個 row，含格式、產生方式、生命週期、source code 位置與 fork 處理狀態。每次 Codex CLI 升版時照 §7 重驗、本表跟著改。
+
+### Headers
+
+| Header | HTTP / WS / Compact | 值的格式 | 產生方式 | 生命週期 | source code | Fork 狀態 |
+|---|---|---|---|---|---|---|
+| `session_id` / `session-id` | All paths | UUIDv7 字串 | `Uuid::now_v7()` 進程啟動時呼叫一次 | 一個 conversation 全程不變；新對話換新 v7 | `protocol/src/session_id.rs:23`、`core/src/client.rs:165`+`315` | ✅ L1 處理（per-auth derive、v7-mimic、timestamp 借用 inbound） |
+| `thread_id` / `thread-id` | All paths | UUIDv7 字串（**獨立於 session_id**） | `Uuid::now_v7()` 進程啟動時呼叫一次 | 同 session_id；常見一個對話一個 | `protocol/src/thread_id.rs:23`、`core/src/client.rs:166`+`316` | ✅ D 處理（獨立 derive stream） |
+| `x-client-request-id` | All paths | **= thread_id 字串**（完全相同） | `headers.insert("x-client-request-id", thread_id)` | 跟 thread_id 一致 | `core/src/client.rs:903-904`、`codex-api/src/endpoint/responses.rs:91-92` | ✅ D 處理（= threadDerived） |
+| `x-codex-window-id` | All paths（standard & WS） | `"{thread_id_uuid}:{integer}"` | `format!("{}:{}", state.thread_id, state.window_generation)`；window_generation = AtomicU64 起始 0，websocket session reset 時 +1 | 一個 thread 內可能 0 / 1 / 2 等，重置時 +1 | `core/src/client.rs:381-385`（current_window_id）+ 167（generation 欄位）+ 376-378（advance） | ❌ **G 待做**（fork 完全沒送） |
+| `x-codex-installation-id` | Compact path 是 header；standard 是 body | UUIDv4 字串 | `Uuid::new_v4().to_string()`，存到 `<codex_home>/installation_id` 檔，啟動時讀；缺檔才生新 | **per install 永不變**（除非檔被刪） | `core/src/installation_id.rs:46` | ❌ **F 待做**（fork 完全沒送） |
+| `x-codex-beta-features` | All paths | 由 config 決定的字串 | `state.beta_features_header`（從 config 讀） | per process | `core/src/client.rs:175`+`1654-1659` | ✅（fork 從 ginHeaders / config 帶過去） |
+| `x-codex-turn-state` | All paths | per-turn 字串 | `turn_state.get()`（OnceLock） | per turn | `core/src/client.rs:1660-1665` | ✅（fork 從 ginHeaders 帶） |
+| `x-codex-turn-metadata` | All paths | per-turn 字串 | `turn_metadata_header` 參數 | per turn | `core/src/client.rs:1666-1668` | ✅（fork 從 ginHeaders 帶） |
+| `x-codex-parent-thread-id` | All paths（subagent flow only） | thread_id 字串 | `parent_thread_id_header_value(session_source)` | conditional：subagent 流程才有 | `core/src/client.rs:614-617` | ⚠️ H 待做（codex direct 應 forward；非 codex 不送） |
+| `x-openai-subagent` | All paths（subagent flow only） | subagent 標籤字串（如 `"review"` `"compact"`） | `subagent_header_value(session_source)` | conditional | `core/src/client.rs:1672-1690` | ⚠️ H 待做 |
+| `x-oai-attestation` | All paths（attestation provider 啟用時） | 設備驗證簽章字串 | `attestation_provider.header_for_request().await` | per request；需要 attestation 配置 | `core/src/client.rs:501-503`+`908-910` | ⚠️ H 待做 |
+| `x-responsesapi-include-timing-metrics` | WS（HTTP 也有但 WS 更常用） | `"true"` | 固定字串，當 `state.include_timing_metrics` 為 true 時加 | per process | `core/src/client.rs:915-919` | ✅（fork 從 ginHeaders 帶） |
+| `OpenAI-Beta` | HTTP=`responses=v1`；WS=`responses_websockets=2026-02-06` | 固定字串 | 寫死 const，路徑差別 | const | `core/src/client.rs:145`、`912-914` | ✅ |
+| `User-Agent` | All paths | `codex_cli_rs/X.Y.Z (OS; arch) terminal/X.Y.Z` | 動態組（runtime.GOOS/GOARCH + version + terminal env） | per process | `core/src/client.rs`（透過 transport）；版本 const | ⚠️ L2：fork 預設寫死 macOS/arm64，靠 config override |
+| `Originator` | All paths | `"codex_cli_rs"` | const | const | `core/src/client.rs` | ✅ |
+| `Authorization` | All paths | `Bearer <access_token>` | OAuth flow 拿到的 token | 每帳號不同；token refresh 時換 | auth crate | ✅（per-auth 自然不同） |
+| `ChatGPT-Account-Id` | All paths（OAuth flow） | account_id from JWT claims | 解 JWT 拿 chatgpt_account_id | 每帳號不同 | login crate / chatgpt 模組 | ✅（per-auth 自然不同） |
+
+### Body 欄位（standard `/responses`）
+
+| 欄位 | 值的格式 | 產生方式 | 生命週期 | source code | Fork 狀態 |
+|---|---|---|---|---|---|
+| `model` | model slug 字串 | request 參數 | per request | — | ✅ 透過 |
+| `instructions` | system prompt 字串 | request 參數 | per request | — | ✅ 透過 |
+| `input` | 對話 messages array | request 參數 | per request | — | ✅ 透過 |
+| `tools` / `tool_choice` / `parallel_tool_calls` | tool 設定 | request 參數 | per request | — | ✅ 透過 |
+| `reasoning` | reasoning config | request 參數 | per request | — | ✅ 透過 |
+| `store` | bool | `provider.is_azure_responses_endpoint()` | 看 provider | `core/src/client.rs:753` | ⚠️ fork 預設 false（非 azure） |
+| `stream` | always `true` | 寫死 | const | `core/src/client.rs:754` | ✅ fork 也強制 true |
+| `include` | array | request 參數 | per request | — | ✅ 透過 |
+| `service_tier` | per-user tier 字串 | request 參數 | per session/user | `core/src/client.rs:743` | ✅ 透過 |
+| `prompt_cache_key` | **= thread_id 字串**（不是 session_id） | `Some(state.thread_id.to_string())` | per session | `core/src/client.rs:742` | ✅ D 處理（= threadDerived） |
+| `text` | output schema params | `create_text_param_for_request(...)` | per request | `core/src/client.rs:737-741` | ✅ 透過 |
+| `client_metadata` | object/HashMap | HashMap，**always 包含 `x-codex-installation-id`** | — | `core/src/client.rs:759-762` | ❌ **F 待做**（非 codex 路徑沒生 client_metadata） |
+
+### Body 欄位（WS `client_metadata` 比 HTTP 更多）
+
+| key in client_metadata | 值 | 來源 |
+|---|---|---|
+| `x-codex-installation-id` | UUIDv4（同 HTTP） | F 範圍 |
+| `x-codex-window-id` | `"{thread_id}:{generation}"`（同 header） | G 範圍 |
+| `x-openai-subagent` | subagent 標籤（conditional） | H 範圍 |
+| `x-codex-parent-thread-id` | parent thread_id（conditional） | H 範圍 |
+| `x-codex-turn-metadata` | turn metadata（conditional） | 既有 |
+
+### 補充細節
+
+- `Uuid::now_v7()` = 48-bit unix-ms timestamp + version 7 + 12-bit rand_a + variant + 62-bit rand_b（RFC 9562）
+- `Uuid::new_v4()` = 122-bit pure random + version 4 + variant
+- `state.session_id` 跟 `state.thread_id` 在 `ModelClient::new()` 時被傳入，兩個是獨立的 v7（兩次連續 `now_v7()` 呼叫，timestamp 通常相同毫秒）
+- `installation_id` 檔案是 0644 權限的純文字，內容就是 UUID 字串本身（沒有 JSON / 結構）
+- `window_generation` 整數從 0 起算，每次 `advance_window_generation()` 增 1（websocket session reset 時呼叫）
+- 真實 client 用 hyper/reqwest，header 案例為 lowercase；HTTP/2 強制 lowercase。fork 用 Go net/http canonicalize 為大小寫混合；HTTP/2 transport 會自動 lowercase，HTTP/1.1（如 WS upgrade）不會——這是 separate 的 case-fidelity 議題，跟 F + G 不衝突
+
+
 ## 4. 上游 `router-for-me/CLIProxyAPI` 怎麼處理三欄位
 
 > 以下是 **fork patch 之前** 的原版行為，分 inbound client 種類記錄。
