@@ -17,15 +17,20 @@
 | `thread_id` / `Thread_id` | request header | UUIDv7 — `state.thread_id`（與 session_id **獨立**） |
 | `thread-id` (連字號版) | request header | 同 `thread_id` |
 | `x-client-request-id` | request header | **= thread_id**（不是另一個值） |
+| `x-codex-window-id` | request header | UUID — `state.current_window_id()`（per UI window 一個，總是會送） |
+| `x-codex-installation-id` | request body 內 `client_metadata`（standard responses）；**也是** request header（compact path） | UUID — `state.installation_id`（client 安裝時產一次，per 安裝固定） |
+| `x-codex-parent-thread-id` | request header | thread_id of parent（**只在 subagent flow 才有**） |
+| `x-openai-subagent` | request header | subagent 標籤字串（**只在 subagent flow 才有**） |
+| `x-oai-attestation` | request header | 設備驗證簽章（**只在 attestation provider 啟用時才有**） |
 | `prompt_cache_key` | request **body** | **= thread_id**（不是 session_id） |
-| `Conversation_id` | WS request header | **未驗證**（要找 WS 路徑的 build code） |
-| `client_metadata.x-codex-installation-id` | request body 內的 metadata map | UUID — `state.installation_id`（client 安裝時產一次，per 安裝固定） |
+| ~~`Conversation_id`~~ | ~~request header~~ | **不存在** — CLIProxyAPI 上游程式碼自己發明的 header，real Codex CLI WS / HTTP 都不送這個 |
 
 關鍵不變式：
 
 - **`session_id ≠ thread_id`**（兩個獨立的 v7）
 - **`prompt_cache_key == thread_id`**（不是 session_id）
 - **`x-client-request-id == thread_id`**
+- **`Conversation_id` 是上游 fork 自己加的 fingerprint，應該 REMOVE**
 
 L1 patch 寫成 `prompt_cache_key == Session_id` 是錯的，要拆開。
 
@@ -62,43 +67,75 @@ impl ThreadId {
 
 ## 3. 真實 Codex CLI 還有哪些 fingerprint-relevant 訊號
 
-從 `codex-rs/core/src/client.rs` 的 build request / build headers 路徑掃出來的：
+> 來源：`codex-rs/core/src/client.rs` 的 `build_responses_options`（line 959）、`build_responses_identity_headers`（line 612）、`build_responses_headers`（line 1648）、`build_websocket_headers`（line 890）、`build_ws_client_metadata`（line 625）；以及 `codex-rs/codex-api/src/endpoint/responses.rs` 的 `stream` 函式（line 75）和 `codex-rs/codex-api/src/requests/headers.rs` 的 `build_session_headers`。
 
-### Headers
-| Header | 值 | 重要性 |
+### Standard HTTP `/responses` 路徑送的 headers
+
+| Header | 值 | 條件 |
 |---|---|---|
-| `User-Agent` | `codex_cli_rs/X.Y.Z (OS; arch) terminal/X.Y.Z` 動態組 | 高（fork 已知問題 L2，靠 config 蓋掉預設） |
-| `Originator` | `codex_cli_rs` | 中（fork 已對齊） |
-| `OpenAI-Beta` | `responses=v1`（HTTP）或 `responses_websockets=v2;...`（WS） | 中（fork 已對齊） |
-| `Authorization` | `Bearer <access_token>` | 必須（每帳號不同） |
-| `Chatgpt-Account-Id` | account_id from JWT | 必須（每帳號不同） |
-| `Version` | Codex CLI 版本號（與 UA 內版本一致） | 中（fork 從 ginHeaders 繼承，可能有不一致風險） |
-| `X-Codex-Turn-State` | turn 狀態 | 中 |
-| `X-Codex-Turn-Metadata` | turn metadata | 中 |
-| `X-Codex-Beta-Features` | beta feature flag | 低 |
-| `X-Responsesapi-Include-Timing-Metrics` | 是否要 timing 資訊 | 低 |
-| `Accept` / `Content-Type` / `Connection` | 標準 HTTP | 透明 |
-| `X-OAI-Attestation` | 設備驗證簽章（特定 provider 才有） | 高（如果有的話）|
+| `session_id` / `session-id` | state.session_id | always |
+| `thread_id` / `thread-id` | state.thread_id | always |
+| `x-client-request-id` | state.thread_id | always (when thread_id present) |
+| `x-codex-window-id` | state.current_window_id() | always |
+| `x-codex-beta-features` | beta features 字串 | 有設定 beta features 時 |
+| `x-codex-turn-state` | turn 狀態 | 有 turn state 時 |
+| `x-codex-turn-metadata` | turn metadata | 有 turn metadata 時 |
+| `x-codex-parent-thread-id` | 父 thread 的 thread_id | 只在 subagent flow |
+| `x-openai-subagent` | subagent 標籤 | 只在 subagent flow |
+| `x-oai-attestation` | attestation token | 啟用 attestation provider 時 |
+| `OpenAI-Beta` | `responses=v1`（預設）| always（HTTP path）|
+| `User-Agent` | `codex_cli_rs/X.Y.Z (OS; arch) terminal/X.Y.Z` 動態組 | always |
+| `Originator` | `codex_cli_rs` | always |
+| `Authorization` | `Bearer <access_token>` | always |
+| `Chatgpt-Account-Id` | account_id | always (when OAuth 不是 API key) |
 
-### Body
+### WS `/responses` upgrade request 額外送的 headers
+
+| Header | 值 | 跟 HTTP 差別 |
+|---|---|---|
+| `OpenAI-Beta` | `responses_websockets=2026-02-06` | **不同值**（HTTP 是 `responses=v1`）|
+| `x-responsesapi-include-timing-metrics` | `true` | 只在 timing flag 開時，HTTP path 也有但 WS 更常用 |
+
+WS path 其它 headers（session_id 家族、x-client-request-id、identity headers）跟 HTTP 一樣。
+
+### Compact `/responses/compact` 路徑（HTTP 子路徑）的不同點
+
+| Header | 差別 |
+|---|---|
+| `x-codex-installation-id` | **這條路徑會把 installation_id 也放進 header**（standard `/responses` 不會） |
+
+### Body 欄位（standard responses）
+
 | 欄位 | 值 |
 |---|---|
-| `prompt_cache_key` | = thread_id（前述） |
-| `client_metadata.x-codex-installation-id` | installation_id |
-| `service_tier` | per-user tier (free / plus / pro / team) |
-| `instructions` | system prompt 字串 |
+| `model` | model slug |
+| `instructions` | system prompt |
 | `input` | conversation messages array |
-| `tools` | tool definition array |
-| `tool_choice` | `"auto"` 預設 |
-| `parallel_tool_calls` | bool |
+| `tools` / `tool_choice` / `parallel_tool_calls` | tool 設定 |
 | `reasoning` | reasoning config |
-| `store` | bool（azure 才設） |
-| `stream` | true |
+| `store` | bool（azure 才設）|
+| `stream` | always true |
 | `include` | array |
-| `text` | text params |
+| `service_tier` | per-user tier |
+| `prompt_cache_key` | **= thread_id 字串** |
+| `text` | output schema params |
+| `client_metadata` | object，**always 包含 `x-codex-installation-id` = state.installation_id** |
+
+### WS body (`build_ws_client_metadata`) 的 client_metadata 多了
+
+WS request body 的 `client_metadata` 比 HTTP 更豐富：
+
+| key | value |
+|---|---|
+| `x-codex-installation-id` | state.installation_id（同 HTTP）|
+| `x-codex-window-id` | state.current_window_id() |
+| `x-openai-subagent` | subagent 標籤（conditional）|
+| `x-codex-parent-thread-id` | 父 thread_id（conditional）|
+| `x-codex-turn-metadata` | turn metadata（conditional）|
 
 ### 其它層
-- **HTTP/2 ALPN 與 header 順序**：Rust hyper / reqwest 的 client 跟 Go net/http 的 header 順序、 frame 順序不同
+
+- **HTTP/2 ALPN 與 header 順序**：Rust hyper / reqwest 的 client 跟 Go net/http 的 header 順序、frame 順序不同
 - **TLS ClientHello / JA4**：Rust rustls vs Go crypto/tls 不同（fork 對 Anthropic 已用 utls，Codex 還沒）
 - **Header 大小寫**：Rust 預設 lowercase，Go http.Header canonicalize 大寫——已對齊（fork 用 `setHeaderCasePreserved` 強制）
 
@@ -191,17 +228,60 @@ if promptCacheKey.Exists() {
 
 ## 6. 還沒做的事
 
-A. **驗證 WS path `Conversation_id` real Codex CLI 送什麼**（從 `codex-rs/core/src/client.rs` line 904 附近的 `headers.insert("x-client-request-id", ...)` 看出 HTTP path 的處理；WS path 的對應位置要在 codex-rs 找 `responses_websockets` 或 `Codex Websocket session` 相關 build code）
+### 已驗證（之前列為 §A / §B / §C，已於 2026-05-10 完成）
 
-B. **驗證 `client_metadata.x-codex-installation-id`**：
-- real client 一定送嗎？
-- 我們 codex direct 是否原樣 forward？非 codex 路徑 synthesize 的 body 有沒有？
+- ✅ **§A WS Conversation_id**：real Codex CLI **不送這個 header**。CLIProxyAPI 上游程式碼自己發明的。修法：刪掉 `applyCodexPromptCacheHeaders` 內的 `headers.Set("Conversation_id", cache.ID)`。
+- ✅ **§B installation_id**：real Codex CLI **always 送在 body 的 `client_metadata.x-codex-installation-id`**（standard responses）；compact path **再加一條 header**。修法：codex direct path 確認 translator 有把 client_metadata 透過去；非 codex 路徑要 synthesize 一個 stable per-auth installation_id 注入 body。
+- ✅ **§C 完整 header 掃描**：見 §3 全表。除了原本知道的 session/thread 系列，real Codex CLI 還 always 送 `x-codex-window-id`，subagent flow 還會送 `x-openai-subagent`、`x-codex-parent-thread-id`，attestation provider 啟用時送 `x-oai-attestation`。WS path 的 `client_metadata` 還包含 window_id 等。
 
-C. **掃 `codex-rs/core/src/client.rs` 完整檢查還有沒有其它 fingerprint header**
+### 後續要做（D-J，priority 由高到低）
 
-D. **修 L1 patch 拆兩個 stream**（session-derived + thread-derived）+ 加 `thread_id` / `thread-id` / `x-client-request-id` header 注入（thread-derived）+ `prompt_cache_key` body 改用 thread-derived
+**D. 修 L1 patch 拆兩個 derive stream**（最高優先）
+- 加 helper 產 `sessionDerived` 跟 `threadDerived` 兩個 v7（兩個 timestamp 應該幾乎相同，random 部分獨立）
+- header 寫入：
+  - `Session_id` / `session_id` / `Session-id` / `session-id` ← `sessionDerived`（**完全相同字串**）
+  - `Thread_id` / `thread_id` / `Thread-id` / `thread-id` ← `threadDerived`（**完全相同字串**，real client 都送）
+  - `X-Client-Request-Id` ← `threadDerived`（real client 跟 thread_id 一致）
+- body 寫入：
+  - `prompt_cache_key` ← `threadDerived`（real client 用 thread_id 字串，不是 session_id）
 
-E. 對應 doc 更新（LEAK_RISKS L1、SESSION_ID_BEHAVIOR、MERGE_GUIDE 不變式表、fingerprint regression test 新增 assertion：`Session_id != prompt_cache_key` 必須成立）
+**E. 移除 `Conversation_id` header**
+- `internal/runtime/executor/codex_websockets_executor.go:817-818` 的 `headers.Set("Conversation_id", cache.ID)` 整行刪掉
+- 對應測試斷言更新
+- regression test 的 `crossAuthLeakFields` 內 `Conversation_id` 條目改為「**must be absent**」而非「must differ」
+
+**F. installation_id 處理**
+- 為每個 OAuth auth 在登入 / 第一次 refresh 時產一個 stable UUID 存到 `auth.Metadata["installation_id"]`（同 `refresh_interval_seconds` 的 metadata 持久化模式）
+- 在 cacheHelper / applyCodexPromptCacheHeaders 內，把 body 的 `client_metadata.x-codex-installation-id` 設成這個值（不論 inbound 是 codex 還是非 codex，統一改寫，避免不一致）
+- 對 compact path 同時加 header
+
+**G. window_id 處理**
+- real client always 送 `x-codex-window-id`
+- 我們 fork 完全沒處理 → 可以選：
+  - 不送（明顯欠缺，是 fingerprint）
+  - synthesize per-(auth, session) 的 stable UUID（複雜度等同 thread_id）
+  - 從 ginHeaders 繼承（codex direct 可以；非 codex 沒有 → 還是要 synthesize）
+
+**H. Subagent / parent_thread_id / attestation**
+- 這些都是 conditional headers（subagent flow / attestation provider 啟用時才有）
+- 對 fork 來說：codex direct path 的 ginHeaders 有就 forward；非 codex 路徑 don't add（多送反而是 fingerprint）
+- 確認 codex direct path 的這幾個 header 有正確 forward（目前 fork 只 forward 一些 X-Codex-* 系列）
+
+**I. WS body `client_metadata` 多欄位處理**
+- WS path 的 client_metadata 比 HTTP 多 window_id、subagent、parent_thread_id、turn_metadata
+- 取決於 F + G + H 怎麼做
+
+**J. 驗證 fork 的 body 有沒有保留 client_metadata field**
+- 對 codex direct path，translator 是否把整個 body 透過去？包含 client_metadata？
+- 對非 codex path，translator synthesize 的 body 應該完全沒有這個 field
+- 用 fingerprint regression test 加一條 assertion：「body 必有 `client_metadata.x-codex-installation-id`」即可監控
+
+### 對應的 doc 更新（隨 D-J 進行）
+
+- LEAK_RISKS L1 — 描述拆兩 stream + 移除 Conversation_id + installation_id 處理
+- SESSION_ID_BEHAVIOR — derive 兩個 stream 的 timestamp 關係、字串完全相同的 reuse 模式
+- MERGE_GUIDE 不變式表 — 加新的不變式（session_derived ≠ thread_derived、prompt_cache_key == thread_derived、Conversation_id absent、installation_id present 等）
+- fingerprint regression test — 加「Session_id ≠ prompt_cache_key」「Conversation_id 不存在」「client_metadata.x-codex-installation-id 存在」三條斷言
 
 ---
 
@@ -282,3 +362,4 @@ curl -s 'https://raw.githubusercontent.com/openai/codex/main/codex-rs/protocol/s
 | 日期 | 事件 | Codex CLI commit / tag |
 |---|---|---|
 | 2026-05-10 | 初次寫此檔。確認 SessionId/ThreadId 都是 v7、prompt_cache_key = thread_id、build_session_headers 四個 header。未驗證 Conversation_id WS、installation_id 處理。 | main HEAD（commit 未記錄；建議下次更新時補上 short hash） |
+| 2026-05-10 | 完成 §A / §B / §C 三項驗證。確認 `Conversation_id` 不存在 real protocol（CLIProxyAPI 自己加的）、`x-codex-installation-id` always 在 body client_metadata、补完 §3 的 HTTP / WS 完整 header 表（多了 x-codex-window-id、x-codex-parent-thread-id、x-openai-subagent、x-oai-attestation 幾條）。 | main HEAD（待補 hash） |
