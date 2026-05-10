@@ -89,6 +89,25 @@ OpenAI 隨時可以對歷史日誌跑「同一 session_id 下出現 ≥2 個 acc
 
 **未涵蓋**：Claude / Antigravity / Gemini / Kimi 後端。Codex/OpenAI 後端是這次 fork 的 patch 範圍。
 
+### F + G — installation_id 與 x-codex-window-id（雙修，2026-05-11）
+
+延續 L1 的「每個 outbound 值都要 per-auth 不同 + 看起來像真的」框架，補完兩個 real Codex CLI 永遠送、原版 fork 完全沒處理的欄位：
+
+- **F: `client_metadata.x-codex-installation-id` (body)**
+  - Real Codex CLI 在 `<codex_home>/installation_id` 存一個 UUIDv4，per install 永不變。
+  - Fork 改在 `auth.Metadata["installation_id"]` 持久化 per OAuth account 的 v4 UUID，跨 auth 各自獨立、單 auth 跨重啟一致——避免「許多 OAuth 都帶同一個 installation_id」這個「同機器多帳號」的池化指紋。
+  - 新檔 `internal/runtime/executor/codex_installation_id.go`：`codexInstallationIDForAuth(auth)` 讀；`ensureCodexInstallationID(auth)` 缺值就 `uuid.New()` 寫。從不覆寫已存在的值。
+  - 種值點：`sdk/auth/codex_device.go:buildAuthRecord` OAuth 登入時 + `internal/runtime/executor/codex_executor.go:Refresh` 成功後（後者只 ensure，不覆蓋）。
+  - 注入點：cacheHelper / applyCodexPromptCacheHeaders 把值寫到 body `client_metadata.x-codex-installation-id`；compact path 額外加 `X-Codex-Installation-Id` header。
+
+- **G: `x-codex-window-id` (header)**
+  - Real Codex CLI 送 `format!("{thread_id}:{window_generation}")`，generation 起始 0、websocket session reset 時 +1。
+  - Fork 用已 derive 的 `threadDerived` 拼 `"{threadDerived}:{generation}"`：codex 直連路徑解 inbound `X-Codex-Window-Id` 抽 generation；非 codex 路徑固定 0。
+  - 自然 cross-auth distinct（threadDerived 已 per-auth）+ 看起來真（thread 部分合法 v7 + colon + integer）。
+  - 注入點：cacheHelper / applyCodexPromptCacheHeaders 寫到 `X-Codex-Window-Id` 兩條 path；WS body 的 `client_metadata.x-codex-window-id` 也補。
+
+- 測試：`codex_installation_id_test.go`（13 個 case）+ regression test 加 4 條斷言（body 必有 v4 installation_id、header 必有 `{uuid}:{int}` 形狀 window_id、thread 部分必須等於 Thread_id、cross-auth 全不同）。`crossAuthLeakFields` 加上 `X-Codex-Window-Id` 與 `client_metadata.x-codex-installation-id`。
+
 ---
 
 ## 🟠 L2：Codex `User-Agent` 寫死 macOS / arm64

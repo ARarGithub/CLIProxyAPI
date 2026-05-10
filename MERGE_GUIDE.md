@@ -42,6 +42,13 @@
 | **derive 輸出對 `(originalID, auth.ID)` 配對在進程 lifetime 內 deterministic** | `TestDerive_Deterministic_*` 跨 50 次呼叫驗證；timestamp cache TTL = 1h，cache 內重用 |
 | **`Thread_id == X-Client-Request-Id == prompt_cache_key`**（real Codex CLI 三個都用 state.thread_id） | regression test 對每個 record 都跑 `tid != xrid` / `tid != pck` 失敗 |
 | **`Session_id ≠ prompt_cache_key`**（real Codex CLI 永不會等於） | regression test 對每個 record 都跑 `sid == pck` 失敗 |
+| **每個 auth 在 metadata 內有 `installation_id`（合法 UUIDv4）** | grep `ensureCodexInstallationID` 在 `buildAuthRecord` (`sdk/auth/codex_device.go`) 與 `Refresh` (`codex_executor.go`) 都呼叫；`TestEnsureCodexInstallationID_*` 三條斷言（生成 v4、preserve 不覆寫、per-auth distinct） |
+| **`ensureCodexInstallationID` 永不覆寫已存在的值**（real client 也不會） | `TestEnsureCodexInstallationID_PreservesExistingValue` |
+| **body 永遠帶 `client_metadata.x-codex-installation-id`** 且為 v4 UUID | regression test 對每個 record assert `gjson.GetBytes(body, "client_metadata.x-codex-installation-id")` 非空、`uuid.Parse` OK、version == 4 |
+| **compact path 多送 `X-Codex-Installation-Id` header** | grep `strings.Contains(url, "/responses/compact")` 在 cacheHelper 內；對應分支設 `X-Codex-Installation-Id` |
+| **`X-Codex-Window-Id` 永遠帶**，格式 `"{uuid}:{integer}"` | regression test 對每個 record assert 存在、形狀對、thread 部分 = `Thread_id` header |
+| **`X-Codex-Window-Id` 的 thread 部分跨 auth 必不同** | `crossAuthLeakFields` 內 `X-Codex-Window-Id` 條目；regression test cross-auth check |
+| **codex 直連路徑保留 inbound `X-Codex-Window-Id` 的 generation 數字** | cacheHelper / applyCodexPromptCacheHeaders 內 `parseInboundWindowGeneration(...)` 讀 ginHeaders；`TestCodexWindowID_RoundTripGenerationFromInbound` 驗證 |
 
 ### L4 不變式
 

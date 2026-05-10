@@ -81,8 +81,10 @@ var crossAuthLeakFields = []fingerprintField{
 	{inHeader, "Thread_id", "Codex thread identifier (HTTP)"},
 	{inHeader, "thread_id", "Codex thread identifier (lowercase, WS)"},
 	{inHeader, "X-Client-Request-Id", "Codex per-thread request id (= thread_id in real Codex CLI)"},
+	{inHeader, "X-Codex-Window-Id", "Codex window id (= thread_id : generation; thread part must differ across auths)"},
 	{inBody, "prompt_cache_key", "Codex prompt cache key (= thread_id in real Codex CLI)"},
 	{inBody, "previous_response_id", "Trivially correlates conversation turns across accounts"},
+	{inBody, "client_metadata.x-codex-installation-id", "Per-install UUIDv4; sharing across accounts identifies single-machine pool"},
 }
 
 // crossAuthMustDifferFields are fields the test EXPECTS to differ across
@@ -171,6 +173,13 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 	}))
 	defer server.Close()
 
+	// In production, the same Auth object lives in the manager's pool across
+	// requests, so its persisted installation_id stays put. The test creates
+	// fresh Auth objects per runOnce call, so without a fixture the stability
+	// check below would always fail. installationIDByAuthID gives the test a
+	// per-(test-run, authID) memory.
+	installationIDByAuthID := map[string]string{}
+
 	runOnce := func(t *testing.T, authID, token string, sc fingerprintScenario) recordedUpstreamRequest {
 		t.Helper()
 		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -186,7 +195,18 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 		auth := &cliproxyauth.Auth{
 			ID:         authID,
 			Attributes: map[string]string{"base_url": server.URL, "api_key": token},
+			// In production, installation_id is seeded at OAuth login
+			// (sdk/auth/codex_device.go) and ensured on Refresh
+			// (codex_executor.go). Reuse the per-(test-run, authID) value if
+			// the harness has seen this auth before, otherwise let
+			// ensureCodexInstallationID generate one and remember it.
+			Metadata: map[string]any{},
 		}
+		if existing := installationIDByAuthID[authID]; existing != "" {
+			auth.Metadata["installation_id"] = existing
+		}
+		ensureCodexInstallationID(auth)
+		installationIDByAuthID[authID] = codexInstallationIDForAuth(auth)
 		executor := NewCodexExecutor(&config.Config{})
 		_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
 			Model:   "gpt-5-codex",
@@ -313,6 +333,46 @@ func TestCodexUpstreamFingerprintRegression_NoCrossAuthCorrelation(t *testing.T)
 				// fabricated it; we must not.
 				if cid := rec.Headers.Get("Conversation_id"); cid != "" {
 					t.Errorf("LEAK: Conversation_id = %q present — real Codex CLI never sends this header", cid)
+				}
+
+				// installation_id: body's client_metadata.x-codex-installation-id
+				// must be present (real Codex CLI always sends it) and must be a
+				// valid UUIDv4 (real Codex CLI uses Uuid::new_v4()). See
+				// LEAK_RISKS.md F, CODEX_CLI_REFERENCE.md §6.F.
+				inst := gjson.GetBytes(rec.Body, "client_metadata.x-codex-installation-id").String()
+				if inst == "" {
+					t.Errorf("MISSING: body.client_metadata.x-codex-installation-id is empty — real Codex CLI always sends it")
+				} else if u, err := uuid.Parse(inst); err != nil {
+					t.Errorf("MALFORMED: client_metadata.x-codex-installation-id = %q is not a UUID: %v", inst, err)
+				} else if v := byte(u.Version()); v != 4 {
+					t.Errorf("MALFORMED: client_metadata.x-codex-installation-id = %q has version %d, want 4 (real Codex CLI uses Uuid::new_v4)", inst, v)
+				}
+
+				// x-codex-window-id: must be present and shaped as
+				// "{uuid}:{integer}". The uuid prefix must equal the derived
+				// Thread_id (so a future fingerprint check that decodes the
+				// thread part still ties to a coherent thread). See
+				// LEAK_RISKS.md G, CODEX_CLI_REFERENCE.md §6.G.
+				wid := rec.Headers.Get("X-Codex-Window-Id")
+				if wid == "" {
+					t.Errorf("MISSING: X-Codex-Window-Id is empty — real Codex CLI always sends it")
+				} else {
+					colon := strings.LastIndex(wid, ":")
+					if colon <= 0 || colon == len(wid)-1 {
+						t.Errorf("MALFORMED: X-Codex-Window-Id = %q must be of form \"{uuid}:{integer}\"", wid)
+					} else {
+						widThread := wid[:colon]
+						widGen := wid[colon+1:]
+						if tid != "" && widThread != tid {
+							t.Errorf("INCONSISTENT: X-Codex-Window-Id thread prefix (%q) != Thread_id (%q)", widThread, tid)
+						}
+						if _, err := uuid.Parse(widThread); err != nil {
+							t.Errorf("MALFORMED: X-Codex-Window-Id thread prefix %q is not a UUID: %v", widThread, err)
+						}
+						if widGen == "" {
+							t.Errorf("MALFORMED: X-Codex-Window-Id = %q has empty generation suffix", wid)
+						}
+					}
 				}
 			}
 

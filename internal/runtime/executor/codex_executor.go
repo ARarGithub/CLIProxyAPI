@@ -735,6 +735,12 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// frequent restarts re-roll on every rebuild and converge the effective
 	// refresh time toward maxLead.
 	auth.Metadata["refresh_interval_seconds"] = int(codexauth.NextRefreshLead().Seconds())
+	// Ensure a per-auth installation_id (UUIDv4) is persisted. Legacy auths
+	// from before LEAK_RISKS.md F won't have one yet; generate-on-first-touch
+	// keeps it stable for the rest of the auth's lifetime, matching real
+	// Codex CLI's per-install persistence semantics. Existing values are
+	// never overwritten.
+	ensureCodexInstallationID(auth)
 	return auth, nil
 }
 
@@ -794,8 +800,26 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	sessionDerived := derivedSessionID(sessionInput, auth)
 	threadDerived := derivedThreadID(threadInput, auth)
 
+	// LEAK_RISKS.md F + G + CODEX_CLI_REFERENCE.md §6.F/§6.G:
+	// - body's client_metadata.x-codex-installation-id always carries a stable
+	//   per-auth UUIDv4 (real Codex CLI sends one per install).
+	// - x-codex-window-id is "{thread_id}:{generation}". For the codex direct
+	//   path the inbound generation is preserved; otherwise 0 (mimic a fresh
+	//   websocket session that has not been reset).
+	installationID := codexInstallationIDForAuth(auth)
+	var windowGeneration uint64
+	if cache.ID == "" {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			windowGeneration = parseInboundWindowGeneration(ginCtx.GetHeader("X-Codex-Window-Id"))
+		}
+	}
+	windowID := codexWindowID(threadDerived, windowGeneration)
+
 	if threadDerived != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", threadDerived)
+	}
+	if installationID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", installationID)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
@@ -807,6 +831,15 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if threadDerived != "" {
 		httpReq.Header.Set("Thread_id", threadDerived)
 		httpReq.Header.Set("X-Client-Request-Id", threadDerived)
+	}
+	if windowID != "" {
+		httpReq.Header.Set("X-Codex-Window-Id", windowID)
+	}
+	if installationID != "" && strings.Contains(url, "/responses/compact") {
+		// Real Codex CLI's compact path additionally carries installation_id
+		// as a header (see codex-rs/core/src/client.rs:487-490). Standard
+		// /responses keeps it in the body only.
+		httpReq.Header.Set("X-Codex-Installation-Id", installationID)
 	}
 	return httpReq, nil
 }

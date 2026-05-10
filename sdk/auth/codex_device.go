@@ -18,6 +18,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+
+	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -277,6 +279,14 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 		// Seed the persisted refresh lead at login time so the first scheduling
 		// cycle uses a deterministic, restart-safe value (see LEAK_RISKS.md A2).
 		"refresh_interval_seconds": int(codex.NextRefreshLead().Seconds()),
+		// Seed a per-auth installation_id (UUIDv4) so the body's
+		// client_metadata.x-codex-installation-id can be emitted from the very
+		// first request. Real Codex CLI generates this once at first run and
+		// persists to <codex_home>/installation_id; the per-auth analogue keeps
+		// it stable per OAuth account and distinct across accounts (avoiding
+		// "many accounts on one machine" as a pool fingerprint). See
+		// LEAK_RISKS.md F, CODEX_CLI_REFERENCE.md §6.F.
+		"installation_id": uuid.New().String(),
 	}
 
 	fmt.Println("Codex authentication successful")

@@ -152,8 +152,8 @@ WS request body 的 `client_metadata` 比 HTTP 更豐富：
 | `session_id` / `session-id` | All paths | UUIDv7 字串 | `Uuid::now_v7()` 進程啟動時呼叫一次 | 一個 conversation 全程不變；新對話換新 v7 | `protocol/src/session_id.rs:23`、`core/src/client.rs:165`+`315` | ✅ L1 處理（per-auth derive、v7-mimic、timestamp 借用 inbound） |
 | `thread_id` / `thread-id` | All paths | UUIDv7 字串（**獨立於 session_id**） | `Uuid::now_v7()` 進程啟動時呼叫一次 | 同 session_id；常見一個對話一個 | `protocol/src/thread_id.rs:23`、`core/src/client.rs:166`+`316` | ✅ D 處理（獨立 derive stream） |
 | `x-client-request-id` | All paths | **= thread_id 字串**（完全相同） | `headers.insert("x-client-request-id", thread_id)` | 跟 thread_id 一致 | `core/src/client.rs:903-904`、`codex-api/src/endpoint/responses.rs:91-92` | ✅ D 處理（= threadDerived） |
-| `x-codex-window-id` | All paths（standard & WS） | `"{thread_id_uuid}:{integer}"` | `format!("{}:{}", state.thread_id, state.window_generation)`；window_generation = AtomicU64 起始 0，websocket session reset 時 +1 | 一個 thread 內可能 0 / 1 / 2 等，重置時 +1 | `core/src/client.rs:381-385`（current_window_id）+ 167（generation 欄位）+ 376-378（advance） | ❌ **G 待做**（fork 完全沒送） |
-| `x-codex-installation-id` | Compact path 是 header；standard 是 body | UUIDv4 字串 | `Uuid::new_v4().to_string()`，存到 `<codex_home>/installation_id` 檔，啟動時讀；缺檔才生新 | **per install 永不變**（除非檔被刪） | `core/src/installation_id.rs:46` | ❌ **F 待做**（fork 完全沒送） |
+| `x-codex-window-id` | All paths（standard & WS） | `"{thread_id_uuid}:{integer}"` | `format!("{}:{}", state.thread_id, state.window_generation)`；window_generation = AtomicU64 起始 0，websocket session reset 時 +1 | 一個 thread 內可能 0 / 1 / 2 等，重置時 +1 | `core/src/client.rs:381-385`（current_window_id）+ 167（generation 欄位）+ 376-378（advance） | ✅ G 完成（threadDerived + parsed inbound generation / 預設 0） |
+| `x-codex-installation-id` | Compact path 是 header；standard 是 body | UUIDv4 字串 | `Uuid::new_v4().to_string()`，存到 `<codex_home>/installation_id` 檔，啟動時讀；缺檔才生新 | **per install 永不變**（除非檔被刪） | `core/src/installation_id.rs:46` | ✅ F 完成（per-auth metadata 持久化、ensureCodexInstallationID never overwrites） |
 | `x-codex-beta-features` | All paths | 由 config 決定的字串 | `state.beta_features_header`（從 config 讀） | per process | `core/src/client.rs:175`+`1654-1659` | ✅（fork 從 ginHeaders / config 帶過去） |
 | `x-codex-turn-state` | All paths | per-turn 字串 | `turn_state.get()`（OnceLock） | per turn | `core/src/client.rs:1660-1665` | ✅（fork 從 ginHeaders 帶） |
 | `x-codex-turn-metadata` | All paths | per-turn 字串 | `turn_metadata_header` 參數 | per turn | `core/src/client.rs:1666-1668` | ✅（fork 從 ginHeaders 帶） |
@@ -313,17 +313,18 @@ if promptCacheKey.Exists() {
 - 測試斷言更新：regression test 對每個 record 跑 `Conversation_id` 必須不存在；websocket 測試專門驗證 conversation-id-like header 都不存在
 - regression test 的 `crossAuthLeakFields` 移除 `Conversation_id`（because absent → 沒得 cross-auth 比對）
 
-**F. installation_id 處理**
-- 為每個 OAuth auth 在登入 / 第一次 refresh 時產一個 stable UUID 存到 `auth.Metadata["installation_id"]`（同 `refresh_interval_seconds` 的 metadata 持久化模式）
-- 在 cacheHelper / applyCodexPromptCacheHeaders 內，把 body 的 `client_metadata.x-codex-installation-id` 設成這個值（不論 inbound 是 codex 還是非 codex，統一改寫，避免不一致）
-- 對 compact path 同時加 header
+**F. installation_id 處理** — ✅ **已完成 2026-05-11**
+- 為每個 OAuth auth 在登入 (`sdk/auth/codex_device.go:buildAuthRecord`) / 第一次 refresh (`codex_executor.go:Refresh` 內 `ensureCodexInstallationID`) 時產一個 `Uuid::new_v4()` 存到 `auth.Metadata["installation_id"]`（同 `refresh_interval_seconds` 的 metadata 持久化模式；**永不覆寫已存在值**）
+- 在 cacheHelper / applyCodexPromptCacheHeaders 把值寫到 body 的 `client_metadata.x-codex-installation-id`
+- Compact path 還額外設 `X-Codex-Installation-Id` header（mirror real client 的 compact-only 行為）
 
-**G. window_id 處理**
-- real client always 送 `x-codex-window-id`
-- 我們 fork 完全沒處理 → 可以選：
-  - 不送（明顯欠缺，是 fingerprint）
-  - synthesize per-(auth, session) 的 stable UUID（複雜度等同 thread_id）
-  - 從 ginHeaders 繼承（codex direct 可以；非 codex 沒有 → 還是要 synthesize）
+**G. window_id 處理** — ✅ **已完成 2026-05-11**
+- 用已 derive 的 `threadDerived` 拼 `format!("{thread}:{generation}")`：
+  - codex 直連路徑：parse inbound `X-Codex-Window-Id` 抽 generation 數字，thread 部分用 derived（避免 leak inbound 的 thread_id）
+  - 非 codex 路徑：固定 generation = 0（mimic 「fresh session 沒被 reset」）
+- 寫到 header `X-Codex-Window-Id`（HTTP + WS 都送）
+- WS body 的 `client_metadata.x-codex-window-id` 也寫（real WS client_metadata 比 HTTP 豐富）
+- 詳見 `LEAK_RISKS.md` F + G 段落、`internal/runtime/executor/codex_installation_id.go`
 
 **H. Subagent / parent_thread_id / attestation**
 - 這些都是 conditional headers（subagent flow / attestation provider 啟用時才有）
@@ -427,3 +428,4 @@ curl -s 'https://raw.githubusercontent.com/openai/codex/main/codex-rs/protocol/s
 | 2026-05-10 | 初次寫此檔。確認 SessionId/ThreadId 都是 v7、prompt_cache_key = thread_id、build_session_headers 四個 header。未驗證 Conversation_id WS、installation_id 處理。 | main HEAD（commit 未記錄；建議下次更新時補上 short hash） |
 | 2026-05-10 | 完成 §A / §B / §C 三項驗證。確認 `Conversation_id` 不存在 real protocol（CLIProxyAPI 自己加的）、`x-codex-installation-id` always 在 body client_metadata、补完 §3 的 HTTP / WS 完整 header 表（多了 x-codex-window-id、x-codex-parent-thread-id、x-openai-subagent、x-oai-attestation 幾條）。 | main HEAD（待補 hash） |
 | 2026-05-11 | 完成 §6 D（拆兩個 derive stream）+ E（移除 Conversation_id header）。L1 patch 從「single derive 寫兩處」改成「session 跟 thread 兩個 namespace 各自 derive、寫入對應 header / body」。新增 `Thread_id` / `X-Client-Request-Id` headers。完整測試套件更新（cross-stream distinctness、Conversation_id absent、Thread_id == prompt_cache_key 等斷言）。 | main HEAD |
+| 2026-05-11 | 完成 §6 F（per-auth installation_id v4 持久化 + body/compact header 注入）+ G（x-codex-window-id 從 derived thread + parsed generation 拼出，HTTP/WS 都送，WS body client_metadata 也補）。新增 13 條 helper 單元測試 + regression test 4 條 F/G 結構性斷言 + cross-auth leak fields 加 X-Codex-Window-Id 與 client_metadata.x-codex-installation-id。 | main HEAD |

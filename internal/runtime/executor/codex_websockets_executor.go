@@ -859,8 +859,30 @@ func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format
 	sessionDerived := derivedSessionID(sessionInput, auth)
 	threadDerived := derivedThreadID(threadInput, auth)
 
+	// LEAK_RISKS.md F + G + CODEX_CLI_REFERENCE.md §6.F/§6.G:
+	// - body's client_metadata.x-codex-installation-id always carries a stable
+	//   per-auth UUIDv4 (real Codex CLI sends one per install).
+	// - x-codex-window-id is "{thread_id}:{generation}". Codex direct path
+	//   preserves the inbound generation; non-codex defaults to 0.
+	installationID := codexInstallationIDForAuth(auth)
+	var windowGeneration uint64
+	if cache.ID == "" {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			windowGeneration = parseInboundWindowGeneration(headerValueCaseInsensitive(ginCtx.Request.Header, "x-codex-window-id"))
+		}
+	}
+	windowID := codexWindowID(threadDerived, windowGeneration)
+
 	if threadDerived != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", threadDerived)
+	}
+	if installationID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", installationID)
+		// Real Codex CLI's WS body's client_metadata is richer than HTTP's; it
+		// also carries x-codex-window-id (see codex-rs/core/src/client.rs:625-656).
+		if windowID != "" {
+			rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-window-id", windowID)
+		}
 	}
 	if sessionDerived != "" {
 		setHeaderCasePreserved(headers, "session_id", sessionDerived)
@@ -868,6 +890,9 @@ func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format
 	if threadDerived != "" {
 		setHeaderCasePreserved(headers, "thread_id", threadDerived)
 		setHeaderCasePreserved(headers, "x-client-request-id", threadDerived)
+	}
+	if windowID != "" {
+		setHeaderCasePreserved(headers, "x-codex-window-id", windowID)
 	}
 	// NOTE: previously this function also set a `Conversation_id` header to the
 	// same value. Real Codex CLI never sends that header (verified against
